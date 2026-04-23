@@ -1,8 +1,3 @@
-# pineditor2D
-IndoorGML 2.0 editor in Python. Note that it does NOT supprt
-- support multi-layer space model
-- 3D visualization.
-
 # pineditor2D — User Manual
 
 pineditor2D is a 2D IndoorGML editor for viewing and editing indoor space models based on the IndoorGML 2 standard.
