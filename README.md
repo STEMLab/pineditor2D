@@ -6,7 +6,8 @@ pineditor2D is a 2D IndoorGML editor for viewing and editing indoor space models
 
 ## 1. Getting Started
 
-Launch `pineditor2D.exe` (or `python pineditor2D.py`).  
+[Download pineditor2D.exe](https://github.com/STEMLab/pineditor2D/releases/tag/indoorgml2.0editor-python)
+Launch `pineditor2D.exe`  
 Open an IndoorGML file via **File → Open...** or start a new model with **File → New**.
 
 ---
