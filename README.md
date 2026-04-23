@@ -108,6 +108,7 @@ Activates edge editing mode (mutually exclusive with Node Edit).
 ### New Door
 Activates door creation mode.  
 - Click on the boundary between two adjacent cells to place a door.
+- Be careful in setting the thickness of door. It can be set in right toolbox (thk) 
 
 ---
 
