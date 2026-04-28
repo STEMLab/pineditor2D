@@ -1,172 +1,181 @@
-# pineditor2D — User Manual
+# pineditor2D
 
-pineditor2D is a 2D IndoorGML editor for viewing and editing indoor space models based on the IndoorGML 2 standard.
+A 2D IndoorGML editor for viewing and editing indoor space models based on the [IndoorGML 2](https://github.com/opengeospatial/IndoorGML-SWG) standard.
 
----
-
-## 1. Getting Started
-
-[Download pineditor2D.exe](https://github.com/STEMLab/pineditor2D/releases/tag/indoorgml2.0editor-python)
-Launch `pineditor2D.exe`  
-Open an IndoorGML file via **File → Open...** or start a new model with **File → New**.
+Built with Python, Tkinter, and Matplotlib.
 
 ---
 
-## 2. File Menu
+## Features
 
-| Action | Description |
+- Open, edit, and save IndoorGML 2 files (`.xml` / `.gml`)
+- Draw and edit **cell spaces** (rooms, corridors, etc.)
+- Split a cell space into two by selecting two vertices
+- Edit the **dual graph** — add, move, and delete nodes and edges
+- Place **doors** between adjacent spaces
+- Load a **floorplan image** as a reference background
+- Assign **function codes** to spaces with color coding
+- Multi-floor support with per-floor view
+- Undo / Redo
+
+---
+
+## Requirements
+
+```
+Python 3.10+
+matplotlib
+numpy
+lxml
+Pillow
+```
+
+Install dependencies:
+
+```bash
+pip install matplotlib numpy lxml Pillow
+```
+
+---
+
+## Running
+
+```bash
+python pineditor2D.py
+```
+
+Or use the standalone Windows executable `pineditor2D.exe` (no Python installation required).
+
+---
+
+## Usage
+
+### File Operations
+
+| Action | Menu |
 |---|---|
-| **New** | Create a new empty model |
-| **Open...** | Open an existing IndoorGML (.xml / .gml) file |
-| **Close** | Close the current model |
-| **Save** | Save changes to the current file |
-| **Save As...** | Save to a new file |
-| **Split by Floor...** | Export each floor as a separate file |
-| **Quit** | Exit the application |
+| New model | File → New |
+| Open IndoorGML file | File → Open... |
+| Save | File → Save |
+| Save to new file | File → Save As... |
+| Export per floor | File → Split by Floor... |
 
 ---
 
-## 3. Navigation
+### Navigation
 
 | Action | How |
 |---|---|
-| **Pan** | Click and drag on empty area |
-| **Zoom in/out** | Mouse scroll wheel |
-| **Select floor** | Use the floor dropdown at the top of the window |
-| **Show all floors** | Select "All" in the floor dropdown |
+| Pan | Click and drag on empty area |
+| Zoom | Mouse scroll wheel |
+| Select floor | Floor dropdown at the top |
 
 ---
 
-## 4. View Menu
+### Cell Menu
 
-| Option | Description |
-|---|---|
-| **Show names** | Toggle cell space name labels |
-| **Show nodes** | Toggle dual graph nodes |
-| **Show floorplan** | Toggle background floorplan image visibility |
-
----
-
-## 5. Cell Menu
-
-### New Cell
-Activates cell drawing mode.  
-- Click on the canvas to add polygon vertices one by one.  
-- **Double-click** (or click near the first vertex) to close and create the cell.  
+#### New Cell
+Draw a new cell space polygon.
+- Click to place vertices.
+- **Double-click** (or click near the first vertex) to close the polygon.
 - **Right-click** to cancel.
 
-### Cell Edit
-Activates cell selection mode.  
-- Click a cell to select it (highlighted in red).  
-- Edit the cell's **name**, **function**, or **level** in the property panel.  
-- Press **Delete** to delete the selected cell.  
-- **Right-click** to deselect.
+#### Cell Edit
+Select and edit an existing cell.
+- Click a cell to select it.
+- Edit **name**, **function**, or **level** in the property panel on the right.
+- Press **Delete** to remove the selected cell.
 
-### Cell Split
-Splits a selected cell into two along a line connecting two of its vertices.
+#### Cell Split
+Split a cell into two parts along a line between two of its vertices.
 
-**Steps:**
-1. Activate **Cell Split** from the Cell menu.
-2. Click on the cell you want to split — its vertices are shown with index numbers.
-3. Click the **first vertex** of the split line.
-4. Click the **second vertex** — the cell is split immediately.
+1. Activate **Cell → Cell Split**.
+2. Click the cell to split — its vertices are labelled with index numbers.
+3. Click the **first vertex**.
+4. Click the **second vertex** — the split is applied immediately.
 
 **Result:**
 - The original cell keeps its ID and name.
-- The new cell gets the ID and name of the original with `_1` appended.
-- A new duality node is created inside the new cell.
-- An edge is automatically added between the two duality nodes.
+- The new cell is assigned the original ID / name with `_1` appended.
+- A duality node is created at the centroid of each sub-cell.
+- An edge between the two nodes is added automatically.
 
 ---
 
-## 6. Network Menu
+### Network Menu
 
-### Node Edit
-Activates node editing mode (mutually exclusive with Edge Edit).
+#### Node Edit
+Add, move, or delete dual graph nodes.  
+*(Mutually exclusive with Edge Edit)*
 
 | Action | How |
 |---|---|
-| Add a node | Click on empty space |
-| Move a node | Click and drag |
-| Select a node | Click on a node (shown with a star ★) |
-| Delete a node | Select it, then press **Delete** |
+| Add node | Click on empty space |
+| Move node | Click and drag |
+| Select node | Click a node (highlighted with ★) |
+| Delete node | Select, then press **Delete** |
 
-### Edge Edit
-Activates edge editing mode (mutually exclusive with Node Edit).
+#### Edge Edit
+Connect or delete edges between nodes.  
+*(Mutually exclusive with Node Edit)*
 
 | Action | How |
 |---|---|
-| Add an edge | Click first node, then click second node |
-| Select an edge | Click on an edge line |
-| Delete an edge | Select it, then press **Delete** |
-| Cancel connection | **Right-click** |
+| Add edge | Click first node, then click second node |
+| Select edge | Click an edge line |
+| Delete edge | Select, then press **Delete** |
+| Cancel | Right-click |
 
 ---
 
-## 7. Door Menu
+### Door Menu
 
-### New Door
-Activates door creation mode.  
-- Click on the boundary between two adjacent cells to place a door.
-- Be careful in setting the thickness of door. It can be set in right toolbox (thk) 
+Activate **Door → New Door** and click on a boundary between two adjacent cells to place a door.
 
 ---
 
-## 8. Floor Menu
+### Floorplan Menu
+
+Load a background image to use as a drawing reference.
 
 | Action | Description |
 |---|---|
-| **Add Floor from File...** | Merge floors from another IndoorGML file |
-| **Delete Floor...** | Remove a floor and all its spaces/nodes/edges |
+| Load Floorplan... | Load a PNG / JPG image |
+| Move Floorplan | Drag to reposition |
+| Resize Floorplan | Drag a corner to resize |
+| Set Extent... | Enter coordinate bounds manually |
+| Opacity... | Adjust image transparency |
 
 ---
 
-## 9. Floorplan Menu
+### View Menu
 
-Load and align a background floor plan image (.png / .jpg) to use as a reference.
-
-| Action | Description |
+| Option | Description |
 |---|---|
-| **Load Floorplan...** | Load an image file as background |
-| **Move Floorplan** | Drag the background image to reposition |
-| **Resize Floorplan** | Drag a corner to resize the background image |
-| **Set Extent...** | Manually enter the coordinate extent of the image |
-| **Opacity...** | Adjust the transparency of the background image |
+| Show names | Toggle cell name labels |
+| Show nodes | Toggle dual graph nodes |
+| Show floorplan | Toggle background image |
 
 ---
 
-## 10. Function Codes Menu
-
-| Action | Description |
-|---|---|
-| **Load Function Codes...** | Load a CSV/JSON file mapping function codes to colors |
-| **Apply Function...** | Assign a function code to the selected cell |
-
----
-
-## 11. Keyboard Shortcuts
+## Keyboard Shortcuts
 
 | Key | Action |
 |---|---|
-| **Ctrl + Z** | Undo |
-| **Ctrl + Y** | Redo |
-| **Delete** | Delete selected cell / node / edge |
-| **Escape** | Cancel current operation |
+| `Ctrl+Z` | Undo |
+| `Ctrl+Y` | Redo |
+| `Delete` | Delete selected item |
+| `Esc` | Cancel current operation |
 
 ---
 
-## 12. Status Bar
+## Output Format
 
-The status bar at the bottom of the window shows:
-- Current edit mode
-- Selected item ID and properties
-- Hints for the next action (e.g., "Click another vertex to split")
+Files are saved as **IndoorGML 2** XML.  
+New items are written on save; existing items are updated in-place.
 
 ---
 
-## 13. Output Format
+## License
 
-Files are saved as **IndoorGML 2** XML (`.xml`).  
-Newly created cells, nodes, and edges are written into the file on save.  
-Items imported from the original file are updated in-place.
-
+MIT
