@@ -527,4 +527,4 @@ geometry and tag.
 
 ## License
 
-Apache License 2.0 (or replace with your preferred license).
+Apache License 2.0 
