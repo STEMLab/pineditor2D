@@ -419,7 +419,11 @@ def parse_indoorgml(xml_path: str) -> IndoorModel:
         ln = local_name(elem.tag)
         if ln in SPACE_TAG_HINTS:
             fid = find_any_id(elem) or f"space_{len(model.spaces)+1}"
-            name = first_text(elem, ["name"]) or ""
+            # The writer emits the human-readable name as `<cellSpaceName>`
+            # (per IndoorGML 2.0). Older files / other tools sometimes
+            # use a plain `<name>` instead, so we accept both.
+            name = (first_text(elem, ["cellSpaceName"])
+                    or first_text(elem, ["name"]) or "")
             level = get_direct_child_text_by_localname(elem, "level") or first_text(elem, ["level"])
             function = get_direct_child_text_by_localname(elem, "function") or first_text(elem, ["function"]) or ""
             polygons = extract_polygons(elem)
@@ -429,6 +433,32 @@ def parse_indoorgml(xml_path: str) -> IndoorModel:
                 c = polygon_centroid(poly)
                 if c is not None:
                     centers.append(c)
+
+            # Extract <duality xlink:href="#nodeId"> — only consider direct
+            # children of this CellSpace so we don't accidentally capture
+            # a duality element of a nested feature.
+            duality: str = ""
+            for sub in elem:
+                if local_name(sub.tag) != "duality":
+                    continue
+                for k, v in sub.attrib.items():
+                    if k.endswith("href"):
+                        rid = href_to_id(v)
+                        if rid:
+                            duality = rid
+                        break
+                if duality:
+                    break
+
+            # IndoorGML 2.0 <poi> element (boolean text, lowercased)
+            is_poi_text = get_direct_child_text_by_localname(elem, "poi")
+            is_poi_flag = (is_poi_text or "").strip().lower() == "true"
+
+            # Heuristic: any cell named "VS_<...>" with no geometry is a
+            # virtual cell created by this editor. Restoring the flag
+            # here keeps later checks (Find Cells without Node, etc.)
+            # consistent across save → reload round-trips.
+            is_virtual_flag = (fid.startswith("VS_") and not polygons)
 
             model.spaces[fid] = SpaceFeature(
                 feature_id=fid,
@@ -440,6 +470,9 @@ def parse_indoorgml(xml_path: str) -> IndoorModel:
                 centers=centers,
                 source_element=elem,
                 layer_id=_layer_of(elem),
+                duality=duality,
+                is_poi=is_poi_flag,
+                is_virtual=is_virtual_flag,
             )
 
     # ── Nodes ────────────────────────────────────────────────────────────────
@@ -623,12 +656,35 @@ def fill_missing_node_coords_from_edges(model: IndoorModel) -> None:
 
 
 def fill_node_levels_from_edges_and_spaces(model: IndoorModel) -> None:
-    """For orphan nodes (no connects to spaces), infer level from connected edges → spaces,
-    and finally from Z coordinate proximity."""
+    """Resolve every node's level. Priority order (first match wins):
+      1. The dual CellSpace (`node.duality`). Most authoritative —
+         IndoorGML 2.0 ties a node and its dual cell to the same floor,
+         and cells are routinely tagged with `<level>` even when nodes
+         are not.
+      2. Any space directly referenced from `node.connects`.
+      3. The level of any space referenced by an edge incident on this
+         node (legacy heuristic — can pick the WRONG floor when the
+         node itself is a vertical-edge endpoint, so it ranks below the
+         duality check).
+      4. Z-coordinate proximity to a known floor reference Z (final
+         fallback).
+
+    Re-runs even when `node.level` is already set IF the duality says
+    a different floor — fixes files that arrived with all nodes
+    mislabeled but with correct cell-level data.
+    """
+    # First pass: trust duality unconditionally (overrides existing
+    # node.level if the dual cell disagrees, since the cell is the
+    # authoritative carrier of `<level>` in IndoorGML 2.0).
     for node in model.nodes.values():
+        if node.duality:
+            sp = model.spaces.get(node.duality)
+            if sp and sp.level:
+                node.level = sp.level
+                continue
         if node.level is not None:
             continue
-        # Connected to a space directly via duality/href
+        # 2) any space referenced from node.connects
         for ref in node.connects:
             sp = model.spaces.get(ref)
             if sp and sp.level:
@@ -636,7 +692,7 @@ def fill_node_levels_from_edges_and_spaces(model: IndoorModel) -> None:
                 break
         if node.level is not None:
             continue
-        # Try via edges: find edges containing this node, then spaces those edges connect
+        # 3) indirect: spaces referenced by edges incident on this node
         for edge in model.edges.values():
             if node.node_id not in edge.connects:
                 continue
@@ -918,6 +974,66 @@ def load_bg_config_for_floor(gml_path: str, floor: str) -> Optional[dict]:
         return None
 
 
+# ── Reference points (file-wide; shared across all floors) ─────────────────
+# Stored under the special key "_reference_points" in the same sidecar
+# JSON so all per-floor entries and the global anchors live together.
+_REFPOINTS_KEY = "_reference_points"
+
+
+def save_reference_points(gml_path: str,
+                          ll: Tuple[float, float],
+                          ur: Tuple[float, float]) -> None:
+    """Persist the two reference (anchor) points to the sidecar JSON."""
+    p = _bgcfg_path(gml_path)
+    cfg: dict = {}
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+    cfg[_REFPOINTS_KEY] = {"LL": [ll[0], ll[1]], "UR": [ur[0], ur[1]]}
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def load_reference_points(gml_path: str
+                          ) -> Optional[Tuple[Tuple[float, float],
+                                              Tuple[float, float]]]:
+    """Return ((LL_x, LL_y), (UR_x, UR_y)) or None."""
+    p = _bgcfg_path(gml_path)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        rp = cfg.get(_REFPOINTS_KEY)
+        if not rp:
+            return None
+        ll = rp.get("LL"); ur = rp.get("UR")
+        if not ll or not ur or len(ll) < 2 or len(ur) < 2:
+            return None
+        return ((float(ll[0]), float(ll[1])),
+                (float(ur[0]), float(ur[1])))
+    except Exception:
+        return None
+
+
+def clear_reference_points(gml_path: str) -> None:
+    p = _bgcfg_path(gml_path)
+    if not os.path.exists(p):
+        return
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if _REFPOINTS_KEY in cfg:
+            cfg.pop(_REFPOINTS_KEY)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def _update_node_coord_in_xml(elem: ET.Element, coord: Tuple[float, float, float]) -> None:
     """Update the first pos/posList inside a Node element to the new coordinate."""
     for sub in elem.iter():
@@ -1101,7 +1217,10 @@ def _get_or_create_dual_space_layer(root: ET.Element) -> ET.Element:
 
 
 def _get_floor_ceiling_z(model: IndoorModel, floor: str):
-    """Return (floor_z, ceiling_z) by inspecting existing spaces on the given floor."""
+    """Return (floor_z, ceiling_z) by inspecting existing spaces on the
+    given floor. Z values are in cm (matching the rest of the editor's
+    coordinate convention).
+    """
     for sp in model.spaces.values():
         if sp.level == floor and len(sp.polygons_3d) >= 2:
             fz = sp.polygons_3d[0][0][2]
@@ -1109,8 +1228,8 @@ def _get_floor_ceiling_z(model: IndoorModel, floor: str):
             return fz, cz
         if sp.level == floor and len(sp.polygons_3d) == 1:
             fz = sp.polygons_3d[0][0][2]
-            return fz, fz + 420
-    return 0.0, 420.0
+            return fz, fz + 300        # default 300 cm head height
+    return 0.0, 300.0
 
 
 def _add_new_spaces_to_xml(model: IndoorModel, new_space_ids: Set[str]) -> None:
@@ -1125,17 +1244,69 @@ def _add_new_spaces_to_xml(model: IndoorModel, new_space_ids: Set[str]) -> None:
     XLINK = f"{{{xlink_ns}}}"
     ID_NS = f"{{{id_ns}}}"
 
+    # Index existing CellSpace elements by id so we never write a duplicate.
+    existing_space_by_id: Dict[str, ET.Element] = {}
+    for elem in root.iter():
+        if local_name(elem.tag) in SPACE_TAG_HINTS:
+            for k, v in elem.attrib.items():
+                if local_name(k) == "id":
+                    existing_space_by_id[v] = elem
+                    break
+
+    # Helper: build a parent map once so we can remove stale elements.
+    parent_of: Dict[ET.Element, ET.Element] = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_of[child] = parent
+
+    def _remove_existing_cellspace(sid: str) -> None:
+        """Excise the existing CellSpace element (and its enclosing
+        cellSpaceMember wrapper, if any) from the tree, so we can write
+        a fresh one with the new geometry."""
+        elem = existing_space_by_id.pop(sid, None)
+        if elem is None:
+            return
+        p = parent_of.get(elem)
+        if p is None:
+            return
+        gp = parent_of.get(p)
+        if gp is not None and local_name(p.tag) == "cellSpaceMember":
+            try:
+                gp.remove(p)
+                return
+            except ValueError:
+                pass
+        try:
+            p.remove(elem)
+        except ValueError:
+            pass
+
     for sid in new_space_ids:
         sp = model.spaces.get(sid)
         if sp is None:
             continue
+
+        # If a CellSpace with this id already exists in the tree we
+        # cannot just rebind to it — its `<gml:pos>` values still
+        # carry the OLD geometry (Normalize Floor Z, Repair, etc. all
+        # rely on regenerating geometry from `sp.polygons_3d`). Drop
+        # the stale element and let the rest of this function emit a
+        # fresh one with the up-to-date polygons.
+        if sid in existing_space_by_id:
+            _remove_existing_cellspace(sid)
+
+        # IndoorGML 2.0 carries the cell subclass in the element local
+        # name (CellSpace / TransferSpace / ConnectionSpace /
+        # AnchorSpace). Pull it from `sp.cls` and fall back to plain
+        # CellSpace.
+        cls_tag = (sp.cls or "CellSpace").strip() or "CellSpace"
 
         # Virtual CellSpace (no geometry, no externalReference) —
         # emit a minimal element and move on.
         if sp.is_virtual or not sp.polygons_3d:
             psl = _get_or_create_psl_for_layer(root, sp.layer_id or "")
             member  = ET.SubElement(psl, f"{CORE}cellSpaceMember")
-            cs_elem = ET.SubElement(member, f"{CORE}CellSpace")
+            cs_elem = ET.SubElement(member, f"{CORE}{cls_tag}")
             cs_elem.attrib[f"{ID_NS}id"] = sid
             if sp.level:
                 lv = ET.SubElement(cs_elem, f"{CORE}level")
@@ -1155,7 +1326,7 @@ def _add_new_spaces_to_xml(model: IndoorModel, new_space_ids: Set[str]) -> None:
 
         floor_pts = sp.polygons_3d[0]  # 2D footprint (floor polygon)
         floor_z = floor_pts[0][2]
-        ceiling_z = sp.polygons_3d[1][0][2] if len(sp.polygons_3d) >= 2 else floor_z + 420
+        ceiling_z = sp.polygons_3d[1][0][2] if len(sp.polygons_3d) >= 2 else floor_z + 300
 
         # Ensure closed ring for floor/ceiling
         ring = list(floor_pts)
@@ -1163,7 +1334,7 @@ def _add_new_spaces_to_xml(model: IndoorModel, new_space_ids: Set[str]) -> None:
             ring.append(ring[0])
 
         member  = ET.SubElement(psl, f"{CORE}cellSpaceMember")
-        cs_elem = ET.SubElement(member, f"{CORE}CellSpace")
+        cs_elem = ET.SubElement(member, f"{CORE}{cls_tag}")
         cs_elem.attrib[f"{ID_NS}id"] = sid
 
         geom_wrap  = ET.SubElement(cs_elem, f"{CORE}cellSpaceGeom")
@@ -1232,13 +1403,44 @@ def _add_new_nodes_to_xml(model: IndoorModel, new_node_ids: Set[str]) -> None:
     GML   = f"{{{gml_ns}}}"
     ID_NS = f"{{{id_ns}}}"
 
+    # Index existing Node elements by id so we never write a second copy
+    # for the same id (defends against undo/redo races and re-creation
+    # under the same auto-generated id).
+    existing_node_by_id: Dict[str, ET.Element] = {}
+    for elem in root.iter():
+        if local_name(elem.tag) == "Node":
+            for k, v in elem.attrib.items():
+                if local_name(k) == "id":
+                    existing_node_by_id[v] = elem
+                    break
+
     for nid in new_node_ids:
         node = model.nodes.get(nid)
         if node is None or node.coord is None:
             continue
         x, y, z = node.coord
 
-        # Select the DualSpaceLayer that belongs to this node's layer
+        if nid in existing_node_by_id:
+            # Already in the tree — update its <pos> (and duality href if
+            # present) in place rather than appending a sibling.
+            n_elem = existing_node_by_id[nid]
+            for sub in n_elem.iter():
+                if local_name(sub.tag) == "pos":
+                    dim = detect_srs_dimension(sub)
+                    sub.text = (f"{x} {y}" if dim == 2
+                                else f"{x} {y} {z}")
+                    break
+            if node.duality:
+                # Replace existing duality children, then add a fresh one
+                for ch in [c for c in list(n_elem)
+                           if local_name(c.tag) == "duality"]:
+                    n_elem.remove(ch)
+                duality_elem = ET.SubElement(n_elem, f"{CORE}duality")
+                duality_elem.attrib[f"{{{xlink_ns}}}href"] = f"#{node.duality}"
+            node.source_element = n_elem
+            continue
+
+        # Brand-new — append to the appropriate DualSpaceLayer
         dsl = _get_or_create_dsl_for_layer(root, node.layer_id or "")
 
         member  = ET.SubElement(dsl, f"{CORE}nodeMember")
@@ -1263,6 +1465,7 @@ def _add_new_nodes_to_xml(model: IndoorModel, new_node_ids: Set[str]) -> None:
             duality_elem.attrib[f"{{{xlink_ns}}}href"] = f"#{duality_space_id}"
 
         node.source_element = n_elem
+        existing_node_by_id[nid] = n_elem
 
 
 def _add_new_edges_to_xml(model: IndoorModel, new_edge_ids: Set[str]) -> None:
@@ -1277,18 +1480,31 @@ def _add_new_edges_to_xml(model: IndoorModel, new_edge_ids: Set[str]) -> None:
     XLINK = f"{{{xlink_ns}}}"
     ID_NS = f"{{{id_ns}}}"
 
+    # Index existing Edge elements by id so we never write a duplicate.
+    existing_edge_by_id: Dict[str, ET.Element] = {}
+    for elem in root.iter():
+        if local_name(elem.tag) == "Edge":
+            for k, v in elem.attrib.items():
+                if local_name(k) == "id":
+                    existing_edge_by_id[v] = elem
+                    break
+
     for eid in new_edge_ids:
         edge = model.edges.get(eid)
         if edge is None or len(edge.coords) < 2:
             continue
 
+        if eid in existing_edge_by_id:
+            # Already in the tree — leave the structural skeleton intact;
+            # the LineString coords are refreshed by the regular update
+            # pass elsewhere if needed. Just bind source_element so future
+            # updates target the right node, and skip appending a copy.
+            edge.source_element = existing_edge_by_id[eid]
+            continue
+
         # Select the DualSpaceLayer that belongs to this edge's layer
         dsl = _get_or_create_dsl_for_layer(root, edge.layer_id or "")
 
-        # Build: <core:edgeMember><core:Edge gml:id="..."><core:weight>...</core:weight>
-        #          <core:connects xlink:href="#n1"/><core:connects xlink:href="#n2"/>
-        #          <core:geometry><gml:LineString gml:id="...">
-        #            <gml:pos>x y z</gml:pos>...</gml:LineString></core:geometry></core:Edge>
         member = ET.SubElement(dsl, f"{CORE}edgeMember")
         e_elem = ET.SubElement(member, f"{CORE}Edge")
         e_elem.attrib[f"{ID_NS}id"] = eid
@@ -1313,6 +1529,7 @@ def _add_new_edges_to_xml(model: IndoorModel, new_edge_ids: Set[str]) -> None:
             pos.text = f"{coord[0]} {coord[1]} {coord[2]}"
 
         edge.source_element = e_elem
+        existing_edge_by_id[eid] = e_elem
 
 
 def _indent_tree(tree: ET.ElementTree) -> None:
@@ -1467,9 +1684,25 @@ def expand_floor_graph(model: IndoorModel, floor_space_ids: Set[str],
     """
     visible_space_ids = set(floor_space_ids)
 
-    # Step 1: nodes on this floor
+    # Step 1: nodes on this floor.
+    # Most reliable signal: the node's DUAL CellSpace. If the dual cell
+    # is on this floor → include. If the dual cell is on ANY OTHER
+    # floor → reject (handles files where every node is mislabeled the
+    # same level even though its dual cell is correctly tagged). Only
+    # nodes WITHOUT a dual cell fall back to their own `node.level`.
     visible_node_ids: Set[str] = set()
     for nid, node in model.nodes.items():
+        dual_level: Optional[str] = None
+        if node.duality:
+            dual_sp = model.spaces.get(node.duality)
+            if dual_sp is not None and dual_sp.level:
+                dual_level = dual_sp.level
+        if dual_level is not None:
+            if dual_level == floor:
+                visible_node_ids.add(nid)
+            # else: dual cell explicitly on a different floor → skip
+            continue
+        # No dual cell or it has no level → use legacy heuristics
         if node.duality and node.duality in visible_space_ids:
             visible_node_ids.add(nid)
         elif floor and node.level == floor:
@@ -1548,10 +1781,12 @@ def draw_on_axes(ax, model: IndoorModel, floor: Optional[str] = None, show_label
                  excluded_space_ids: Optional[Set[str]] = None,
                  show_nodes: bool = True,
                  function_color_map: Optional[Dict[str, str]] = None,
+                 function_label_map: Optional[Dict[str, str]] = None,
                  excluded_node_ids: Optional[Set[str]] = None,
                  layer_id: Optional[str] = None,
                  bg_layer_id: Optional[str] = None,
-                 bg_floor: Optional[str] = None) -> None:
+                 bg_floor: Optional[str] = None,
+                 show_offfloor_anchors: bool = True) -> None:
     ax.clear()
     ax.set_facecolor("black")
     ax.figure.patch.set_facecolor("black")
@@ -1681,69 +1916,217 @@ def draw_on_axes(ax, model: IndoorModel, floor: Optional[str] = None, show_label
         ax.add_collection(LineCollection(
             border_segs, colors="white", linewidths=1.0, zorder=2))
 
-    # Edges — batch with LineCollection
+    # ------------------------------------------------------------------
+    # Classify vertical edges + their endpoints up front. We need this for
+    # both edge coloring (downstair / upstair distinct color) and node
+    # coloring (orange lower endpoint, blue current-floor down-link, hidden
+    # upper endpoint).
+    # ------------------------------------------------------------------
+    specific_floor = bool(floor) and floor != "All"
+    lower_off_ids: Set[str] = set()
+    upper_off_ids: Set[str] = set()
+    cur_with_lower: Set[str] = set()
+    downstair_edge_ids: Set[str] = set()
+    upstair_edge_ids:   Set[str] = set()
+    cur_floor_z: Optional[float] = None
+    if specific_floor:
+        for s_id in visible_space_ids:
+            sp = model.spaces.get(s_id)
+            if sp is not None and sp.polygons_3d:
+                cur_floor_z = sp.polygons_3d[0][0][2]
+                break
+
+        Z_EPS = 50.0  # mm — tolerance for "Z equals current floor Z"
+
+        def _on_current_floor(n: NodeFeature) -> bool:
+            # Most authoritative: the dual CellSpace's level. Some
+            # files mislabel every node "1F" while keeping the cells
+            # tagged correctly per floor — using the dual cell here
+            # makes vertical-edge classification still work in those
+            # files (without it, a 2F node mislabeled "1F" would be
+            # treated as a 1F endpoint and the edge would render as a
+            # normal same-floor edge instead of a vertical one).
+            if n.duality:
+                dual_sp = model.spaces.get(n.duality)
+                if dual_sp is not None and dual_sp.level:
+                    return dual_sp.level == floor
+            if n.level == floor:
+                return True
+            if cur_floor_z is None or n.coord is None:
+                return False
+            return abs(n.coord[2] - cur_floor_z) < Z_EPS
+
+        for edge_id, edge in model.edges.items():
+            if layer_id and edge.layer_id != layer_id:
+                continue
+            # `e.connects` may contain non-node refs (the parsed
+            # `<duality>` xlink:href points to a CellSpace, not a Node).
+            # Pull out only entries that resolve to real Nodes.
+            node_pairs = [
+                (c, model.nodes[c]) for c in edge.connects
+                if c in model.nodes
+            ]
+            if len(node_pairs) < 2:
+                continue
+            on_cur_ids = [c for c, n in node_pairs if _on_current_floor(n)]
+            if not on_cur_ids:
+                continue
+
+            edge_goes_down = False
+            edge_goes_up   = False
+            for c, n in node_pairs:
+                if _on_current_floor(n) or n.coord is None:
+                    continue
+                # Decide above/below via the off-floor node's DUAL CELL
+                # (most reliable when node levels are mislabeled). Fall
+                # back to the node's own Z otherwise.
+                other_z: Optional[float] = None
+                if n.duality:
+                    dual_sp = model.spaces.get(n.duality)
+                    if dual_sp is not None and dual_sp.polygons_3d:
+                        other_z = dual_sp.polygons_3d[0][0][2]
+                if other_z is None:
+                    other_z = n.coord[2]
+                if cur_floor_z is None:
+                    lower_off_ids.add(c)
+                    edge_goes_down = True
+                elif other_z < cur_floor_z - Z_EPS:
+                    lower_off_ids.add(c)
+                    edge_goes_down = True
+                elif other_z > cur_floor_z + Z_EPS:
+                    upper_off_ids.add(c)
+                    edge_goes_up = True
+                else:
+                    # Off-floor by name but same Z — treat as upper to
+                    # be safe (hidden) so a dangling cross-floor edge
+                    # doesn't get drawn as a normal same-floor edge.
+                    upper_off_ids.add(c)
+                    edge_goes_up = True
+            if edge_goes_down:
+                cur_with_lower.update(on_cur_ids)
+                downstair_edge_ids.add(edge_id)
+            if edge_goes_up:
+                upstair_edge_ids.add(edge_id)
+
+    # Edges — batch with LineCollection (3 buckets: normal, down, up)
     if show_nodes:
-        edge_segs: List = []
+        normal_segs: List = []
+        down_segs:   List = []
+        up_segs:     List = []
         for edge_id in visible_edge_ids:
             edge = edges_dict.get(edge_id)
-            if edge is not None and len(edge.coords) >= 2:
-                edge_segs.append([(p[0], p[1]) for p in edge.coords])
-        if edge_segs:
+            if edge is None or len(edge.coords) < 2:
+                continue
+            seg = [(p[0], p[1]) for p in edge.coords]
+            if edge_id in downstair_edge_ids:
+                down_segs.append(seg)
+            elif edge_id in upstair_edge_ids:
+                up_segs.append(seg)
+            else:
+                normal_segs.append(seg)
+        if normal_segs:
             ax.add_collection(LineCollection(
-                edge_segs, colors="deepskyblue",
+                normal_segs, colors="deepskyblue",
                 linewidths=1.0, zorder=3))
+        if down_segs:
+            # Downstair vertical edges — magenta/salmon family
+            ax.add_collection(LineCollection(
+                down_segs, colors="orchid",
+                linewidths=1.6, zorder=4))
+        if up_segs:
+            # Upstair vertical edges — lime/green family
+            ax.add_collection(LineCollection(
+                up_segs, colors="limegreen",
+                linewidths=1.6, zorder=4))
 
     if show_nodes:
         nx: List[float] = []
         ny: List[float] = []
-        # Off-floor endpoints of *vertical edges* only — drawn in orange when
-        # a single floor is being visualized. A vertical edge is an edge whose
-        # two endpoint nodes live on different floors; only the endpoint on
-        # the *other* floor needs this extra highlight.
-        off_nx: List[float] = []
-        off_ny: List[float] = []
-        specific_floor = bool(floor) and floor != "All"
+        lower_nx: List[float] = []
+        lower_ny: List[float] = []
+        cur_blue_nx: List[float] = []
+        cur_blue_ny: List[float] = []
 
-        # Step 1: collect off-floor endpoints of vertical edges incident on
-        # the current floor. These nodes are pulled into visible_node_ids by
-        # expand_floor_graph(), but we want them drawn orange — *not* tomato.
-        vertical_off_node_ids: Set[str] = set()
-        if specific_floor:
-            for edge_id, edge in model.edges.items():
-                if layer_id and edge.layer_id != layer_id:
-                    continue
-                if len(edge.connects) < 2:
-                    continue
-                endpoints = [model.nodes.get(c) for c in edge.connects]
-                if any(n is None for n in endpoints):
-                    continue
-                levels  = [n.level for n in endpoints]
-                on_cur  = any(lv == floor for lv in levels)
-                off_cur = [eid for eid, lv in zip(edge.connects, levels)
-                           if lv and lv != floor]
-                if on_cur and off_cur:
-                    vertical_off_node_ids.update(off_cur)
+        Z_EPS_NODE = 50.0   # mm — same tolerance as vertical-edge logic
 
-        # Step 2: classify each node — off-floor vertical endpoints go to the
-        # orange bucket, everything else visible goes to the tomato bucket.
+        # Classify each node — drop upper-floor vertical endpoints entirely.
         for node_id, node in model.nodes.items():
             if excluded_node_ids and node_id in excluded_node_ids:
                 continue
             if node.coord is None:
                 continue
-            if node_id in vertical_off_node_ids:
-                off_nx.append(node.coord[0])
-                off_ny.append(node.coord[1])
-            elif node_id in visible_node_ids:
-                nx.append(node.coord[0])
-                ny.append(node.coord[1])
+            if node_id in upper_off_ids:
+                continue                              # hidden
+            if node_id in lower_off_ids:
+                if show_offfloor_anchors:
+                    lower_nx.append(node.coord[0])
+                    lower_ny.append(node.coord[1])
+                # else: drop the cross-floor anchor entirely
+                continue
+            if node_id in cur_with_lower:
+                if show_offfloor_anchors:
+                    cur_blue_nx.append(node.coord[0])
+                    cur_blue_ny.append(node.coord[1])
+                else:
+                    # The blue marker would have flagged a current-floor
+                    # node that links downward — without anchors visible
+                    # we just render it as a normal current-floor node.
+                    nx.append(node.coord[0])
+                    ny.append(node.coord[1])
+                continue
+            if node_id not in visible_node_ids:
+                continue
+            # Final guard: even if the node sneaked into visible_node_ids
+            # (e.g. via expand_floor_graph step 3 pulling in the other
+            # endpoint of a vertical edge), drop it when its own floor
+            # clearly does NOT match the active floor.
+            #
+            # Three independent signals are checked, in priority order:
+            #   1. The DUAL CellSpace's level. This is the most
+            #      authoritative — files often mislabel `node.level`
+            #      while keeping `cell.level` correct, so we trust the
+            #      dual cell first.
+            #   2. The node's own `level` text (`node.level == floor`).
+            #   3. The node's Z coordinate matching the active floor's
+            #      reference Z (handles legacy nodes with empty level).
+            # The node passes only when at least one signal places it on
+            # the active floor AND the dual cell does NOT contradict it.
+            if specific_floor:
+                dual_level: Optional[str] = None
+                if node.duality:
+                    dual_sp = model.spaces.get(node.duality)
+                    if dual_sp is not None and dual_sp.level:
+                        dual_level = dual_sp.level
+                # Strong rejection: dual cell's level explicitly says
+                # the node belongs to another floor — drop it even if
+                # its own .level / Z claim otherwise (handles files
+                # where every node is mislabelled "1F" but the cells
+                # are tagged correctly per floor).
+                if dual_level and dual_level != floor:
+                    continue
+                node_on_floor = (node.level == floor)
+                if not node_on_floor and dual_level == floor:
+                    node_on_floor = True
+                if (not node_on_floor and cur_floor_z is not None
+                        and abs(node.coord[2] - cur_floor_z)
+                            < Z_EPS_NODE):
+                    node_on_floor = True
+                if not node_on_floor:
+                    continue
+            nx.append(node.coord[0])
+            ny.append(node.coord[1])
 
         if nx:
             ax.scatter(nx, ny, color="tomato", s=18, zorder=5)
-        if off_nx:
-            # Draw orange ABOVE tomato so it is never occluded by a co-drawn
-            # tomato point when floors are visually aligned.
-            ax.scatter(off_nx, off_ny, color="orange", s=22, zorder=6,
+        if cur_blue_nx:
+            # Current-floor node that links down to a lower floor — drawn
+            # in dodgerblue and slightly larger so it stands out against
+            # surrounding tomato nodes and the deepskyblue edge lines.
+            ax.scatter(cur_blue_nx, cur_blue_ny, color="dodgerblue",
+                       s=22, zorder=6, alpha=1.0,
+                       edgecolors="black", linewidths=0.6)
+        if lower_nx:
+            ax.scatter(lower_nx, lower_ny, color="orange", s=22, zorder=6,
                        alpha=1.0, edgecolors="black", linewidths=0.6)
 
     ax.set_title(f"Floor: {floor_title}", color="white", fontsize=9, pad=3)
@@ -1764,9 +2147,19 @@ def draw_on_axes(ax, model: IndoorModel, floor: Optional[str] = None, show_label
         used_codes = {sp.function for sp in model.spaces.values()
                       if sp.function and sp.function in function_color_map}
         if used_codes:
+            # Show the human-readable label loaded from the function-
+            # codes CSV when available; fall back to the bare code if
+            # no label was provided for that entry.
+            def _legend_label(c: str) -> str:
+                if function_label_map:
+                    label = function_label_map.get(c)
+                    if label and label != c:
+                        return label
+                return c
             patches = [
                 mpatches.Patch(facecolor=function_color_map[code], alpha=0.30,
-                               edgecolor="white", linewidth=0.5, label=code)
+                               edgecolor="white", linewidth=0.5,
+                               label=_legend_label(code))
                 for code in sorted(used_codes)
             ]
             leg = ax.legend(handles=patches, loc="upper left", fontsize=7,
@@ -1798,6 +2191,12 @@ class IndoorGMLViewerApp:
         self.label_var = tk.BooleanVar(value=True)
         self.show_nodes_var = tk.BooleanVar(value=True)
         self.show_ilc_var   = tk.BooleanVar(value=True)
+        # Off-floor anchor markers (lower-floor vertical-edge endpoints
+        # in orange, current-floor nodes that link down in dodgerblue).
+        # Default OFF so a single-floor view shows ONLY that floor's
+        # nodes; users who want the cross-floor anchors visible can turn
+        # this back on from the View menu.
+        self.show_offfloor_anchors_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Open an IndoorGML file.")
         self.edit_status_var = tk.StringVar(value="")
 
@@ -1817,6 +2216,22 @@ class IndoorGMLViewerApp:
         self._graph_connect_mode = False
         self._graph_connect_mode_var = tk.BooleanVar(value=False)
         self._space_create_mode_var = tk.BooleanVar(value=False)
+        # Rectangle-shortcut variant of New Cell — pick two opposite
+        # corners; the editor expands them into a 4-vertex polygon.
+        self._rect_create_mode = False
+        self._rect_create_mode_var = tk.BooleanVar(value=False)
+        self._rect_create_pt1: Optional[Tuple[float, float]] = None
+        # Multi-cell function-code apply mode (Function Codes →
+        # "Multiple Cells (bulk apply)"). Click cells to add/remove
+        # them from a selection set, then Apply to assign one chosen
+        # function code to all of them.
+        self._multi_apply_mode = False
+        self._multi_apply_selected: Set[str] = set()
+        self._multi_apply_code: str = ""
+        # Multi-cell Class bulk-apply mode (Cell → "Class Bulk Apply")
+        self._multi_class_mode = False
+        self._multi_class_selected: Set[str] = set()
+        self._multi_class_value: str = ""
         self._graph_connect_first: Optional[str] = None
         # Measure distance mode (Misc → Measure Distance)
         self._measure_mode: bool = False
@@ -1847,7 +2262,8 @@ class IndoorGMLViewerApp:
         self._door_mode = False
         self._door_mode_var = tk.BooleanVar(value=False)
         self._door_pt1: Optional[Tuple[float, float]] = None
-        self._door_thickness_var = tk.DoubleVar(value=200.0)
+        # Door rectangle thickness in cm (typical ~10–30 cm)
+        self._door_thickness_var = tk.DoubleVar(value=20.0)
 
         # InterLayerConnection mode
         self._ilc_mode = False
@@ -1860,6 +2276,13 @@ class IndoorGMLViewerApp:
         # View-only selection (when no edit mode is active)
         self._view_selected_type: Optional[str] = None   # "space" | "node" | "edge"
         self._view_selected_id: Optional[str] = None
+        # Optional override: when set, the view-selection highlight uses
+        # this XY (and Z, if given) instead of looking up the model's
+        # cached coord. Needed for "duplicate id" navigation where the
+        # picked copy may live at a different location than the one the
+        # model dict happens to reference.
+        self._view_selected_override_xy: Optional[Tuple[float, float]] = None
+        self._view_selected_override_poly: Optional[List[Tuple[float, float]]] = None
 
         self._undo_stack: List[dict] = []      # undo history (max 50)
 
@@ -1896,6 +2319,17 @@ class IndoorGMLViewerApp:
         self._bg_image = None        # numpy array loaded from image file
         self._bg_image_path = ""     # original file path for config save/restore
         self._bg_extent = None       # [xmin, xmax, ymin, ymax] in data coordinates
+        # File-wide reference (anchor) points — shared across all floors.
+        # Loaded from / saved to the bgcfg sidecar. None until set.
+        self._reference_points: Optional[Tuple[Tuple[float, float],
+                                               Tuple[float, float]]] = None
+        # Anchor-capture mode state (B-style click flow)
+        self._anchor_mode = False
+        self._anchor_step = 0          # 1 → expecting LL, 2 → expecting UR
+        self._anchor_canvas_pt1: Optional[Tuple[float, float]] = None
+        self._anchor_canvas_pt2: Optional[Tuple[float, float]] = None
+        self._anchor_world_pt1:  Optional[Tuple[float, float]] = None
+        self._anchor_world_pt2:  Optional[Tuple[float, float]] = None
         self._bg_alpha = tk.DoubleVar(value=0.5)
         self._bg_visible = tk.BooleanVar(value=True)
         self._bg_move_mode = False
@@ -1968,12 +2402,25 @@ class IndoorGMLViewerApp:
         view_menu.add_checkbutton(label="Show nodes",     variable=self.show_nodes_var, command=self.refresh_view)
         view_menu.add_checkbutton(label="Show floorplan", variable=self._bg_visible,    command=self.refresh_view)
         view_menu.add_checkbutton(label="Show ILC",       variable=self.show_ilc_var,   command=self.refresh_view)
+        view_menu.add_checkbutton(label="Show off-floor anchors",
+                                  variable=self.show_offfloor_anchors_var,
+                                  command=self.refresh_view)
 
         _, cell_menu = _make_mb("Cell")
-        cell_menu.add_checkbutton(label="New Cell",   variable=self._space_create_mode_var, command=self.toggle_space_create_mode)
+        cell_menu.add_checkbutton(label="New Cell (Rectangle)",
+                                  variable=self._rect_create_mode_var,
+                                  command=self.toggle_rect_create_mode)
+        cell_menu.add_checkbutton(label="New Cell (Free-style Polygon)",
+                                  variable=self._space_create_mode_var,
+                                  command=self.toggle_space_create_mode)
         cell_menu.add_checkbutton(label="Cell Edit",  variable=self._edit_mode_var,         command=self.toggle_edit_mode,
                                   accelerator="C")
         cell_menu.add_checkbutton(label="Cell Split", variable=self._split_mode_var,        command=self.toggle_split_mode)
+        cell_menu.add_separator()
+        self._multi_class_mode_var = tk.BooleanVar(value=False)
+        cell_menu.add_checkbutton(label="Class Bulk Apply",
+                                  variable=self._multi_class_mode_var,
+                                  command=self.toggle_multi_class_mode)
 
         _, self._network_menu = _make_mb("Network")
         self._network_menu.add_checkbutton(label="Node Edit", variable=self._graph_edit_mode_var,    command=self.toggle_graph_edit_mode,
@@ -1989,12 +2436,6 @@ class IndoorGMLViewerApp:
         door_menu.add_checkbutton(label="New Door", variable=self._door_mode_var, command=self.toggle_door_mode,
                                   accelerator="D")
 
-        _, floor_menu = _make_mb("Floor")
-        floor_menu.add_command(label="New Floor...",          command=self.new_floor)
-        floor_menu.add_command(label="Add Floor from File...", command=self.add_floor_from_file)
-        floor_menu.add_separator()
-        floor_menu.add_command(label="Delete Floor...",       command=self.delete_floor)
-
         _, self._layer_menu = _make_mb("Layer")
         self._layer_menu.add_command(label="New Layer...",    command=self.new_layer)
         self._layer_menu.add_separator()
@@ -2009,25 +2450,49 @@ class IndoorGMLViewerApp:
         self._ilc_connect_menu.add_command(label="List Connections...", command=self.list_ilc)
         self._ilc_connect_menu.add_command(label="Delete Connection...", command=self.delete_ilc)
 
-        _, self._fp_menu = _make_mb("Floorplan")
-        self._fp_menu.add_command(label="Load Floorplan...",   command=self.load_background)
+        # Unified "Floor" menu — combines floor management (create / add /
+        # delete) with floorplan-image alignment (load / move / resize /
+        # extent / reference points / opacity). Previously these were in
+        # two separate menus ("Floor" and "Floorplan") which was redundant.
+        _, self._fp_menu = _make_mb("Floor")
+        self._fp_menu.add_command(label="New Floor...",          command=self.new_floor_and_load_floorplan)
+        self._fp_menu.add_command(label="Add Floor from File...", command=self.add_floor_from_file)
+        self._fp_menu.add_command(label="Delete Floor...",       command=self.delete_floor)
         self._fp_menu.add_separator()
-        self._fp_menu.add_checkbutton(label="Move Floorplan",   variable=self._bg_move_mode_var,   command=self.toggle_bg_move_mode)
-        self._fp_menu.add_checkbutton(label="Resize Floorplan", variable=self._bg_resize_mode_var, command=self.toggle_bg_resize_mode)
-        self._fp_menu.add_command(label="Set Extent...",        command=self.set_background_extent)
+        self._fp_menu.add_command(label="Load Floorplan...",     command=self.load_background)
+        self._fp_menu.add_checkbutton(label="Move Floorplan",    variable=self._bg_move_mode_var,   command=self.toggle_bg_move_mode)
+        self._fp_menu.add_checkbutton(label="Resize Floorplan",  variable=self._bg_resize_mode_var, command=self.toggle_bg_resize_mode)
+        self._fp_menu.add_command(label="Set Extent...",         command=self.set_background_extent)
         self._fp_menu.add_separator()
-        self._fp_menu.add_command(label="Opacity...",           command=self.set_bg_opacity)
+        self._fp_menu.add_command(label="Set Reference Points...", command=self.set_reference_points)
+        self._fp_menu.add_separator()
+        self._fp_menu.add_command(label="Opacity...",            command=self.set_bg_opacity)
 
         _, self._fn_menu = _make_mb("Function Codes")
         self._fn_menu.add_command(label="Load Function Codes...", command=self.load_function_codes_file)
         self._fn_menu.add_command(label="Apply Function...",      command=self.apply_function_dialog, state="disabled")
+        self._multi_apply_mode_var = tk.BooleanVar(value=False)
+        self._fn_menu.add_checkbutton(label="Multiple Cells (bulk apply)",
+                                      variable=self._multi_apply_mode_var,
+                                      command=self.toggle_multi_apply_mode,
+                                      state="disabled")
 
-        _, self._misc_menu = _make_mb("Misc")
+        _, self._misc_menu = _make_mb("Check")
         self._misc_menu.add_command(label="Create Virtual CellSpaces for Standalone Nodes...",
                                     command=self.create_virtual_cellspaces_for_orphan_nodes)
         self._misc_menu.add_separator()
         self._misc_menu.add_command(label="Find Isolated Nodes & CellSpaces...",
                                     command=self.find_isolated_nodes_and_spaces)
+        self._misc_menu.add_command(label="Find Nodes without Duality...",
+                                    command=self.find_nodes_without_duality)
+        self._misc_menu.add_command(label="Find Cells without Node...",
+                                    command=self.find_cells_without_node)
+        self._misc_menu.add_command(label="Find Duality Conflicts...",
+                                    command=self.find_duality_conflicts)
+        self._misc_menu.add_command(label="Normalize Floor Z...",
+                                    command=self.normalize_floor_z)
+        self._misc_menu.add_command(label="Find Duplicate IDs...",
+                                    command=self.find_duplicate_ids)
         self._misc_menu.add_command(label="Search by ID / Name...",
                                     command=self.search_by_id_or_name)
         self._misc_menu.add_separator()
@@ -2090,8 +2555,8 @@ class IndoorGMLViewerApp:
 
         thick_row = ttk.Frame(right, style="TB.TFrame")
         thick_row.pack(anchor="w", fill="x")
-        ttk.Label(thick_row, text="Door thk:", style="TB.TLabel").pack(side="left")
-        ttk.Spinbox(thick_row, from_=10.0, to=10000.0, increment=10.0,
+        ttk.Label(thick_row, text="Door thk (cm):", style="TB.TLabel").pack(side="left")
+        ttk.Spinbox(thick_row, from_=1.0, to=1000.0, increment=1.0,
                     textvariable=self._door_thickness_var,
                     width=8, font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=(2, 0))
 
@@ -2101,8 +2566,13 @@ class IndoorGMLViewerApp:
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=2)
         ttk.Label(right, text="Selection:", style="TB.TLabel").pack(anchor="w")
-        info_frame = ttk.Frame(right, style="TB.TFrame")
-        info_frame.pack(anchor="w", fill="both", expand=True, pady=(2, 0))
+        # `_info_outer` is the slot that swaps between the read-only
+        # Text view and the editable property form (Cell Edit mode).
+        self._info_outer = ttk.Frame(right, style="TB.TFrame")
+        self._info_outer.pack(anchor="w", fill="both", expand=True,
+                              pady=(2, 0))
+        info_frame = ttk.Frame(self._info_outer, style="TB.TFrame")
+        info_frame.pack(anchor="w", fill="both", expand=True)
         self._info_text = tk.Text(
             info_frame, width=22, wrap="word",
             font=("Consolas", 9, "bold"), relief="flat",
@@ -2114,6 +2584,8 @@ class IndoorGMLViewerApp:
         self._info_text.configure(yscrollcommand=_info_sb.set)
         _info_sb.pack(side="right", fill="y")
         self._info_text.pack(side="left", fill="both", expand=True)
+        self._info_text_frame = info_frame
+        self._info_edit_frame: Optional[ttk.Frame] = None
 
         # Canvas fills remaining space
         self.figure = Figure(dpi=100)
@@ -2473,6 +2945,8 @@ class IndoorGMLViewerApp:
         self._vertical_edge_mode = False;      self._vertical_edge_mode_var.set(False)
         self._vertical_edge_first_node = None; self._vertical_edge_first_floor = None
         self._space_create_mode = False;       self._space_create_mode_var.set(False)
+        self._rect_create_mode = False;        self._rect_create_mode_var.set(False)
+        self._rect_create_pt1 = None
         self._split_mode = False;              self._split_mode_var.set(False)
         self._split_space_id = None;           self._split_vertex_idx = None
         self._split_pt1 = None
@@ -2502,6 +2976,12 @@ class IndoorGMLViewerApp:
         self._bg_image_path = ""
         self._bg_extent = None
         self._restore_bg_for_floor("All")
+        # Restore file-wide reference (anchor) points if previously set
+        if self.model and self.model.source_path:
+            self._reference_points = load_reference_points(
+                self.model.source_path)
+        else:
+            self._reference_points = None
         self._view_locked = False
         self.refresh_view()
 
@@ -2527,10 +3007,13 @@ class IndoorGMLViewerApp:
                 excluded_space_ids=excluded,
                 show_nodes=self.show_nodes_var.get(),
                 function_color_map=self._function_color_map or None,
+                function_label_map=(dict(self._function_codes)
+                                    if self._function_codes else None),
                 excluded_node_ids=ex_nodes,
                 layer_id=self._layer_id_from_combo(),
                 bg_layer_id=self._bg_layer_id_from_combo(),
                 bg_floor=self._bg_floor_from_combo(),
+                show_offfloor_anchors=self.show_offfloor_anchors_var.get(),
             )
             self._draw_background()
             self._draw_view_selection_overlay()
@@ -2541,9 +3024,13 @@ class IndoorGMLViewerApp:
             self._draw_split_overlay()
             self._draw_ilc_overlay()
             self._draw_measure_overlay()
+            self._draw_reference_points_overlay()
+            self._draw_multi_apply_overlay()
+            self._draw_multi_class_overlay()
 
             # Re-attach preview lines after ax.clear() removed them
-            if self._space_create_mode and self._space_create_preview_line is not None:
+            if ((self._space_create_mode or self._rect_create_mode)
+                    and self._space_create_preview_line is not None):
                 self.ax.add_line(self._space_create_preview_line)
             if self._door_mode and self._door_pt1 is not None:
                 self.ax.add_line(self._door_preview_line)
@@ -3302,6 +3789,30 @@ class IndoorGMLViewerApp:
         if event.x is None or event.y is None:
             return
 
+        # Anchor-capture (Reference Point) mode runs above any other
+        # click handler so it never collides with edit modes.
+        if self._anchor_mode:
+            if event.button == 3:
+                # Right-click cancels the in-progress capture
+                self._end_anchor_capture()
+                return
+            if event.button == 1 and event.xdata is not None and event.ydata is not None:
+                self._on_anchor_click(event.xdata, event.ydata)
+            return
+
+        # Multi-cell function-code / class bulk-apply modes: only the
+        # LEFT click toggles a cell. Right-click must fall through to
+        # the standard pan handler at the bottom of this function so
+        # the user can pan the canvas while picking many cells.
+        if self._multi_apply_mode and event.button == 1:
+            if event.xdata is not None and event.ydata is not None:
+                self._on_multi_apply_click(event.xdata, event.ydata)
+            return
+        if self._multi_class_mode and event.button == 1:
+            if event.xdata is not None and event.ydata is not None:
+                self._on_multi_class_click(event.xdata, event.ydata)
+            return
+
         if event.button == 1 and self._bg_resize_mode:
             if event.xdata is not None and event.ydata is not None and self._bg_extent is not None:
                 self._bg_resize_handle = self._find_resize_handle(event.xdata, event.ydata)
@@ -3427,15 +3938,15 @@ class IndoorGMLViewerApp:
                 dy = y2 - y1
                 dist = math.hypot(dx, dy)
                 self._measure_pt1 = None
-                # Coordinates are in mm by IndoorGML convention; show both.
+                # Coordinates are in cm; show cm and the m equivalent.
                 msg = (
-                    f"Distance: {dist:,.2f} mm  ({dist/1000.0:,.4f} m)\n"
-                    f"  Δx = {dx:,.2f} mm    Δy = {dy:,.2f} mm\n"
+                    f"Distance: {dist:,.2f} cm  ({dist/100.0:,.4f} m)\n"
+                    f"  Δx = {dx:,.2f} cm    Δy = {dy:,.2f} cm\n"
                     f"  pt1 = ({x1:,.2f}, {y1:,.2f})\n"
                     f"  pt2 = ({x2:,.2f}, {y2:,.2f})"
                 )
                 self.status_var.set(
-                    f"Distance = {dist:,.2f} mm  ({dist/1000.0:,.4f} m)  "
+                    f"Distance = {dist:,.2f} cm  ({dist/100.0:,.4f} m)  "
                     f"Δx={dx:,.1f} Δy={dy:,.1f}")
                 self.refresh_view()
                 messagebox.showinfo("Measure Distance", msg)
@@ -3454,6 +3965,48 @@ class IndoorGMLViewerApp:
                 self._door_preview_line.set_data([], [])
                 self._finish_door_creation(self._door_pt1, pt2)
                 self._door_pt1 = None
+            return
+
+        # --- Rectangle create mode (two opposite corners) ---
+        if self._rect_create_mode:
+            if event.xdata is None or event.ydata is None:
+                return
+            if event.button == 3:
+                self._rect_create_pt1 = None
+                if self._space_create_preview_line is not None:
+                    self._space_create_preview_line.set_data([], [])
+                self._graph_edit_status_var.set(
+                    "Rectangle: click first corner. (Right-click cancels.)")
+                self.refresh_view()
+                return
+            if event.button != 1:
+                return
+            if self._rect_create_pt1 is None:
+                self._rect_create_pt1 = (event.xdata, event.ydata)
+                self._graph_edit_status_var.set(
+                    f"Rectangle: pt1=({event.xdata:.1f}, "
+                    f"{event.ydata:.1f}) — click opposite corner.")
+                self.refresh_view()
+            else:
+                x1, y1 = self._rect_create_pt1
+                x2, y2 = event.xdata, event.ydata
+                if abs(x2 - x1) < 1e-6 or abs(y2 - y1) < 1e-6:
+                    self._graph_edit_status_var.set(
+                        "Rectangle: corners must differ in both x and y.")
+                    return
+                xmin, xmax = min(x1, x2), max(x1, x2)
+                ymin, ymax = min(y1, y2), max(y1, y2)
+                # Build a 4-vertex CCW polygon (LL, LR, UR, UL) and reuse
+                # the existing finishing path so all bookkeeping is shared
+                # with the polygon mode (name dialog, level, undo, etc.).
+                self._space_create_verts = [
+                    (xmin, ymin), (xmax, ymin),
+                    (xmax, ymax), (xmin, ymax),
+                ]
+                self._rect_create_pt1 = None
+                if self._space_create_preview_line is not None:
+                    self._space_create_preview_line.set_data([], [])
+                self._finish_space_creation()
             return
 
         # --- Space create mode ---
@@ -3525,7 +4078,9 @@ class IndoorGMLViewerApp:
                     f"Both nodes are on floor '{first_floor}' — change Floor first.")
                 return
 
-            eid = self._create_edge(first_id, node_id)
+            # Vertical Edge legitimately needs cross-floor → opt in.
+            eid = self._create_edge(first_id, node_id,
+                                    allow_cross_floor=True)
             if eid:
                 self._push_undo({"kind": "create_edge", "edge_id": eid})
                 self._graph_edit_status_var.set(
@@ -3637,6 +4192,12 @@ class IndoorGMLViewerApp:
                     self._graph_selected_edge = None
                     self._pending_node_pos = None
                     self._graph_drag_node = None
+                    # Mirror the selection into the Selection info panel
+                    # so the user sees the node's properties (incl. the
+                    # dual cell's Name) while in Node Edit mode.
+                    self._view_selected_type = "node"
+                    self._view_selected_id = node_id
+                    self._show_view_selection()
                     self._graph_edit_status_var.set(
                         f"Node {node_id} selected — click again to drag, Delete to delete.")
                     self.refresh_view()
@@ -3824,6 +4385,9 @@ class IndoorGMLViewerApp:
                 if was_dragged:
                     # Keep node selected after drag so user can delete or drag again
                     self._graph_selected_node = node_id
+                    self._view_selected_type = "node"
+                    self._view_selected_id = node_id
+                    self._show_view_selection()
                     self._graph_edit_status_var.set(
                         f"Node {node_id} moved — click again to drag, Delete to delete.")
                 self.refresh_view()
@@ -3933,6 +4497,21 @@ class IndoorGMLViewerApp:
         if self._space_create_mode and self._space_create_verts:
             if event.inaxes == self.ax and event.xdata is not None and event.ydata is not None:
                 self._update_space_create_preview((event.xdata, event.ydata))
+            return
+
+        if (self._rect_create_mode
+                and self._rect_create_pt1 is not None
+                and self._space_create_preview_line is not None):
+            if (event.inaxes == self.ax
+                    and event.xdata is not None and event.ydata is not None):
+                x1, y1 = self._rect_create_pt1
+                x2, y2 = event.xdata, event.ydata
+                xs = [x1, x2, x2, x1, x1]
+                ys = [y1, y1, y2, y2, y1]
+                self._space_create_preview_line.set_data(xs, ys)
+            else:
+                self._space_create_preview_line.set_data([], [])
+            self.canvas.draw_idle()
             return
 
         if self._graph_edit_mode and self._graph_drag_node is not None:
@@ -4111,6 +4690,313 @@ class IndoorGMLViewerApp:
             + (f" — {n_colored} spaces colored" if self.model else "")
         )
         self._fn_menu.entryconfig("Apply Function...", state="normal")
+        self._fn_menu.entryconfig("Multiple Cells (bulk apply)",
+                                   state="normal")
+        self.refresh_view()
+
+    # ------------------------------------------------------------------
+    # Function Codes → "Multiple Cells (bulk apply)"
+    # ------------------------------------------------------------------
+    def toggle_multi_apply_mode(self) -> None:
+        """Enter / exit multi-cell function-code bulk-apply mode.
+
+        Workflow:
+          1. Toggle the menu item ON. A small modal asks for the
+             function code to apply (one of the loaded codes).
+          2. The user clicks cells on the canvas to add them to the
+             selection set; clicking a cell again removes it.
+             Selected cells are highlighted in cyan on top of their
+             usual fill.
+          3. The user opens **Function Codes → Multiple Cells…** menu
+             item again (or right-click) to pop the Apply / Cancel
+             dialog. Apply assigns the chosen code to every selected
+             cell in one shot; Cancel exits without changes.
+        """
+        want_on = self._multi_apply_mode_var.get()
+        if not want_on:
+            # User toggled OFF → present Apply / Cancel dialog (this is
+            # how the workflow ends — the menu toggle doubles as the
+            # finish button).
+            if self._multi_apply_mode:
+                self._multi_apply_finish()
+            else:
+                self.status_var.set("")
+                self.refresh_view()
+            return
+
+        if not self._function_codes:
+            messagebox.showwarning("No codes",
+                                   "Load a function code CSV first.")
+            self._multi_apply_mode_var.set(False)
+            return
+
+        # Ask for the code first, then enter selection mode.
+        code = self._prompt_function_code(initial="")
+        if not code:
+            self._multi_apply_mode_var.set(False)
+            return
+        # Mutually exclusive with other edit modes
+        self._deactivate_all_edit_modes()
+        self._multi_apply_mode = True
+        self._multi_apply_mode_var.set(True)
+        self._multi_apply_code = code
+        self._multi_apply_selected.clear()
+        self.status_var.set(
+            f"Multi-apply '{code}': click cells to toggle. "
+            "Re-toggle the menu item to Apply or Cancel.")
+        self.refresh_view()
+
+    def _prompt_function_code(self,
+                              initial: str = "") -> Optional[str]:
+        """Modal pull-down dialog returning a chosen function code,
+        or None on cancel."""
+        if not self._function_codes:
+            return None
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Pick Function Code")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        ttk.Label(dlg, text="Function code:").grid(
+            row=0, column=0, padx=12, pady=(12, 4), sticky="e")
+        labels = [f"{c} — {d}" if c != d else c
+                  for c, d in self._function_codes]
+        var = tk.StringVar()
+        combo = ttk.Combobox(dlg, textvariable=var, values=labels,
+                             state="readonly", width=36)
+        combo.grid(row=0, column=1, padx=(4, 12), pady=(12, 4))
+        if initial:
+            for i, (code, _) in enumerate(self._function_codes):
+                if code == initial:
+                    combo.current(i); break
+        elif labels:
+            combo.current(0)
+        out: List[Optional[str]] = [None]
+        def _ok():
+            idx = combo.current()
+            if 0 <= idx < len(self._function_codes):
+                out[0] = self._function_codes[idx][0]
+            dlg.destroy()
+        btn = ttk.Frame(dlg)
+        btn.grid(row=1, column=0, columnspan=2, pady=(4, 12))
+        ttk.Button(btn, text="OK", command=_ok).pack(side="left", padx=6)
+        ttk.Button(btn, text="Cancel", command=dlg.destroy
+                   ).pack(side="left", padx=6)
+        dlg.bind("<Return>", lambda e: _ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.wait_window()
+        return out[0]
+
+    def _on_multi_apply_click(self, xdata: float, ydata: float) -> None:
+        """Toggle a cell in the multi-apply selection set."""
+        sp_id = self._find_space_at(xdata, ydata)
+        if sp_id is None:
+            return
+        if sp_id in self._multi_apply_selected:
+            self._multi_apply_selected.discard(sp_id)
+        else:
+            self._multi_apply_selected.add(sp_id)
+        self.status_var.set(
+            f"Multi-apply '{self._multi_apply_code}': "
+            f"{len(self._multi_apply_selected)} cell(s) selected. "
+            "Re-toggle the menu item to Apply or Cancel.")
+        self.refresh_view()
+
+    def _draw_multi_apply_overlay(self) -> None:
+        """Highlight every cell currently in the multi-apply set."""
+        if not self._multi_apply_mode or self.model is None:
+            return
+        if not self._multi_apply_selected:
+            return
+        from matplotlib.collections import PolyCollection as _PC
+        verts: List = []
+        for sid in self._multi_apply_selected:
+            sp = self.model.spaces.get(sid)
+            if not sp or not sp.polygons_3d:
+                continue
+            verts.append([(p[0], p[1]) for p in sp.polygons_3d[0]])
+        if verts:
+            self.ax.add_collection(_PC(
+                verts, facecolors=[(0, 1, 1, 0.30)],
+                edgecolors="cyan", linewidths=1.5, zorder=15))
+
+    def _multi_apply_finish(self) -> None:
+        """Pop a confirm dialog and commit the bulk function-code change."""
+        n = len(self._multi_apply_selected)
+        if n == 0:
+            if not messagebox.askyesno(
+                "Multiple Cells",
+                "No cells selected. Exit multi-apply mode?"):
+                # Re-tick the var so the menu stays on
+                self._multi_apply_mode_var.set(True)
+                return
+            self._multi_apply_mode = False
+            self._multi_apply_code = ""
+            self.status_var.set("")
+            self.refresh_view()
+            return
+        if not messagebox.askyesno(
+            "Multiple Cells",
+            f"Apply function code '{self._multi_apply_code}' "
+            f"to {n} selected cell(s)?"):
+            # Restore mode (user wants to keep editing the selection)
+            self._multi_apply_mode_var.set(True)
+            return
+        code = self._multi_apply_code
+        for sid in list(self._multi_apply_selected):
+            sp = self.model.spaces.get(sid)
+            if sp is None:
+                continue
+            sp.function = code
+            if sp.source_element is not None:
+                self._update_function_in_xml(sp.source_element, code)
+        # Exit mode
+        self._multi_apply_mode = False
+        self._multi_apply_selected.clear()
+        self._multi_apply_code = ""
+        self.status_var.set(
+            f"Function code '{code}' applied to {n} cell(s). "
+            "Save the file to persist.")
+        self.refresh_view()
+
+    # ------------------------------------------------------------------
+    # Cell → "Class Bulk Apply"
+    # ------------------------------------------------------------------
+    _CLASS_OPTIONS = ("CellSpace", "TransferSpace",
+                      "ConnectionSpace", "AnchorSpace")
+
+    def toggle_multi_class_mode(self) -> None:
+        """Enter / exit the bulk Class-rewrite mode for cells.
+
+        Workflow mirrors `toggle_multi_apply_mode`:
+          1. Toggle ON → small dialog asks for the target Class.
+          2. Click cells on the canvas to toggle them in/out of the
+             selection set (highlighted in cyan).
+          3. Toggle OFF → confirm → every selected cell's CellSpace
+             element is retagged in place to the target Class.
+        """
+        want_on = self._multi_class_mode_var.get()
+        if not want_on:
+            if self._multi_class_mode:
+                self._multi_class_finish()
+            else:
+                self.status_var.set("")
+                self.refresh_view()
+            return
+
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            self._multi_class_mode_var.set(False)
+            return
+
+        cls = self._prompt_class_value()
+        if not cls:
+            self._multi_class_mode_var.set(False)
+            return
+        self._deactivate_all_edit_modes()
+        self._multi_class_mode = True
+        self._multi_class_mode_var.set(True)
+        self._multi_class_value = cls
+        self._multi_class_selected.clear()
+        self.status_var.set(
+            f"Class bulk-apply '{cls}': click cells to toggle. "
+            "Re-toggle the menu item to Apply or Cancel.")
+        self.refresh_view()
+
+    def _prompt_class_value(self) -> Optional[str]:
+        """Modal pull-down dialog returning a CellSpace subclass name,
+        or None on cancel."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Pick Class")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        ttk.Label(dlg, text="Class:").grid(
+            row=0, column=0, padx=12, pady=(12, 4), sticky="e")
+        var = tk.StringVar(value=self._CLASS_OPTIONS[0])
+        combo = ttk.Combobox(dlg, textvariable=var,
+                             values=list(self._CLASS_OPTIONS),
+                             state="readonly", width=24)
+        combo.grid(row=0, column=1, padx=(4, 12), pady=(12, 4))
+        combo.current(0)
+        out: List[Optional[str]] = [None]
+        def _ok():
+            v = var.get().strip()
+            if v in self._CLASS_OPTIONS:
+                out[0] = v
+            dlg.destroy()
+        btn = ttk.Frame(dlg)
+        btn.grid(row=1, column=0, columnspan=2, pady=(4, 12))
+        ttk.Button(btn, text="OK", command=_ok).pack(side="left", padx=6)
+        ttk.Button(btn, text="Cancel", command=dlg.destroy
+                   ).pack(side="left", padx=6)
+        dlg.bind("<Return>", lambda e: _ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.wait_window()
+        return out[0]
+
+    def _on_multi_class_click(self, xdata: float, ydata: float) -> None:
+        sp_id = self._find_space_at(xdata, ydata)
+        if sp_id is None:
+            return
+        if sp_id in self._multi_class_selected:
+            self._multi_class_selected.discard(sp_id)
+        else:
+            self._multi_class_selected.add(sp_id)
+        self.status_var.set(
+            f"Class bulk-apply '{self._multi_class_value}': "
+            f"{len(self._multi_class_selected)} cell(s) selected. "
+            "Re-toggle the menu item to Apply or Cancel.")
+        self.refresh_view()
+
+    def _draw_multi_class_overlay(self) -> None:
+        if not self._multi_class_mode or self.model is None:
+            return
+        if not self._multi_class_selected:
+            return
+        from matplotlib.collections import PolyCollection as _PC
+        verts: List = []
+        for sid in self._multi_class_selected:
+            sp = self.model.spaces.get(sid)
+            if not sp or not sp.polygons_3d:
+                continue
+            verts.append([(p[0], p[1]) for p in sp.polygons_3d[0]])
+        if verts:
+            self.ax.add_collection(_PC(
+                verts, facecolors=[(0, 1, 1, 0.30)],
+                edgecolors="cyan", linewidths=1.5, zorder=15))
+
+    def _multi_class_finish(self) -> None:
+        n = len(self._multi_class_selected)
+        cls = self._multi_class_value
+        if n == 0:
+            if not messagebox.askyesno(
+                "Class Bulk Apply",
+                "No cells selected. Exit bulk-apply mode?"):
+                self._multi_class_mode_var.set(True)
+                return
+            self._multi_class_mode = False
+            self._multi_class_value = ""
+            self.status_var.set("")
+            self.refresh_view()
+            return
+        if not messagebox.askyesno(
+            "Class Bulk Apply",
+            f"Set Class to '{cls}' for {n} selected cell(s)?"):
+            self._multi_class_mode_var.set(True)
+            return
+        for sid in list(self._multi_class_selected):
+            sp = self.model.spaces.get(sid)
+            if sp is None:
+                continue
+            sp.cls = cls
+            # Reuse the in-place property patcher; it rewrites the XML
+            # element's tag (CellSpace → TransferSpace / …).
+            self._patch_cellspace_xml_props(sp)
+        self._multi_class_mode = False
+        self._multi_class_selected.clear()
+        self._multi_class_value = ""
+        self.status_var.set(
+            f"Class '{cls}' applied to {n} cell(s). "
+            "Save the file to persist.")
         self.refresh_view()
 
     def apply_function_dialog(self) -> None:
@@ -4222,10 +5108,30 @@ class IndoorGMLViewerApp:
             self._bg_extent = None
 
     def load_background(self) -> None:
+        """Load a floorplan image and align it via two reference anchors.
+
+        Workflow (B-style click capture):
+
+          1. User picks an image file.
+          2. The image is shown at a default 1:1 pixel-extent so the
+             user can SEE it on the canvas.
+          3. Anchor-capture mode begins. Status bar prompts the user to
+             click the LL anchor on the canvas. If no file-wide
+             reference points are set yet (first floorplan), a small
+             dialog asks for the world (x, y) of that click. If they
+             ARE set, the saved world coords are reused without asking.
+          4. Same for the UR anchor.
+          5. From the two (canvas, world) pairs the editor solves a 2-
+             axis affine transform and re-extents the image so that the
+             two clicked pixels land exactly at their world targets.
+        """
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
         path = filedialog.askopenfilename(
             title="Open Background Image",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")]
-        )
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
+                       ("All files", "*.*")])
         if not path:
             return
         try:
@@ -4235,23 +5141,204 @@ class IndoorGMLViewerApp:
             messagebox.showerror("Error", f"Failed to load image:\n{e}")
             return
 
-        # Auto-fit extent to model bounding box (all spaces, all floors)
-        if self.model:
-            xs, ys = [], []
-            for sp in self.model.spaces.values():
-                if sp.polygons_3d:
-                    for x, y, _ in sp.polygons_3d[0]:
-                        xs.append(x)
-                        ys.append(y)
-            if xs:
-                self._bg_extent = [min(xs), max(xs), min(ys), max(ys)]
-        if self._bg_extent is None:
-            h, w = self._bg_image.shape[:2]
-            self._bg_extent = [0, w, 0, h]
+        # Default 1:1 pixel-extent so the image is visible while the user
+        # picks anchors. This will be overwritten in step 5.
+        h_, w_ = self._bg_image.shape[:2]
+        self._bg_extent = [0.0, float(w_), 0.0, float(h_)]
 
         self._bg_visible.set(True)
         self._save_bg_config()
         self.refresh_view()
+        self.fit_to_extent()         # zoom to image so user can click on it
+
+        # Pre-load saved reference world coords (if any)
+        saved = None
+        if self.model.source_path:
+            saved = load_reference_points(self.model.source_path)
+        self._reference_points = saved
+
+        # Begin click-capture
+        self._begin_anchor_capture(saved)
+
+    # ----------------------------------------------------------------
+    # Anchor-capture mode (B-style)
+    # ----------------------------------------------------------------
+    def _begin_anchor_capture(
+        self,
+        saved: Optional[Tuple[Tuple[float, float], Tuple[float, float]]]
+    ) -> None:
+        """Enter the two-click anchor-capture mode."""
+        self._deactivate_all_edit_modes()
+        self._anchor_mode = True
+        self._anchor_step = 1                       # 1 → wait for LL, 2 → UR
+        self._anchor_canvas_pt1 = None
+        self._anchor_canvas_pt2 = None
+        self._anchor_world_pt1: Optional[Tuple[float, float]] = (
+            saved[0] if saved else None)
+        self._anchor_world_pt2: Optional[Tuple[float, float]] = (
+            saved[1] if saved else None)
+        msg = ("Reference Points: click LL on the floorplan."
+               + (f"  (saved world coord {saved[0]} will be reused)"
+                  if saved else "  (you will be asked for its world coord)"))
+        self.status_var.set(msg)
+        self.refresh_view()
+
+    def _end_anchor_capture(self) -> None:
+        self._anchor_mode = False
+        self._anchor_step = 0
+        self._anchor_canvas_pt1 = None
+        self._anchor_canvas_pt2 = None
+        self._anchor_world_pt1 = None
+        self._anchor_world_pt2 = None
+        self.status_var.set("")
+        self.refresh_view()
+
+    def _ask_world_xy(self,
+                      title: str,
+                      default: Optional[Tuple[float, float]] = None
+                      ) -> Optional[Tuple[float, float]]:
+        """Pop a tiny modal asking for a world (x, y); return None on cancel."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        try:
+            dlg.transient(self.root)
+        except Exception:
+            pass
+        ttk.Label(dlg, text="World coordinate:").grid(
+            row=0, column=0, columnspan=4, padx=12, pady=(10, 4), sticky="w")
+        ttk.Label(dlg, text="x =").grid(row=1, column=0, padx=(12, 2), sticky="e")
+        x_var = tk.StringVar(value=f"{default[0]:g}" if default else "")
+        e_x = ttk.Entry(dlg, textvariable=x_var, width=14)
+        e_x.grid(row=1, column=1, padx=(2, 8), pady=4)
+        ttk.Label(dlg, text="y =").grid(row=1, column=2, padx=(0, 2), sticky="e")
+        y_var = tk.StringVar(value=f"{default[1]:g}" if default else "")
+        ttk.Entry(dlg, textvariable=y_var, width=14).grid(
+            row=1, column=3, padx=(2, 12), pady=4)
+        out: List[Optional[Tuple[float, float]]] = [None]
+        def _ok():
+            try:
+                out[0] = (float(x_var.get().strip()),
+                          float(y_var.get().strip()))
+            except ValueError:
+                messagebox.showwarning(title,
+                                       "Both values must be numbers.",
+                                       parent=dlg)
+                return
+            dlg.destroy()
+        btn = ttk.Frame(dlg)
+        btn.grid(row=2, column=0, columnspan=4, pady=(6, 12))
+        ttk.Button(btn, text="OK",     command=_ok).pack(side="left", padx=4)
+        ttk.Button(btn, text="Cancel", command=dlg.destroy
+                   ).pack(side="left", padx=4)
+        e_x.focus_set()
+        dlg.bind("<Return>", lambda e: _ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.wait_window()
+        return out[0]
+
+    def _on_anchor_click(self, xdata: float, ydata: float) -> None:
+        """Handle a left-click while in anchor-capture mode."""
+        if self._anchor_step == 1:
+            self._anchor_canvas_pt1 = (xdata, ydata)
+            if self._anchor_world_pt1 is None:
+                w = self._ask_world_xy("LL Reference — World Coord")
+                if w is None:
+                    self._end_anchor_capture()
+                    return
+                self._anchor_world_pt1 = w
+            self._anchor_step = 2
+            self.status_var.set(
+                "Reference Points: click UR on the floorplan."
+                + (f"  (saved world coord {self._anchor_world_pt2} "
+                   "will be reused)"
+                   if self._anchor_world_pt2 else
+                   "  (you will be asked for its world coord)"))
+            self.refresh_view()
+            return
+
+        if self._anchor_step == 2:
+            self._anchor_canvas_pt2 = (xdata, ydata)
+            if self._anchor_world_pt2 is None:
+                w = self._ask_world_xy("UR Reference — World Coord")
+                if w is None:
+                    self._end_anchor_capture()
+                    return
+                self._anchor_world_pt2 = w
+            # Ensure LL is actually lower-left of UR in world coords
+            ll_w = self._anchor_world_pt1
+            ur_w = self._anchor_world_pt2
+            if ll_w[0] >= ur_w[0] or ll_w[1] >= ur_w[1]:
+                messagebox.showwarning(
+                    "Reference Points",
+                    "Lower-Left must be strictly below and to the left "
+                    "of Upper-Right in world coordinates.\n"
+                    "Re-doing the capture.")
+                self._begin_anchor_capture(self._reference_points)
+                return
+
+            # Solve 2-axis affine: new_world = a * old_world + b
+            (cx1, cy1) = self._anchor_canvas_pt1
+            (cx2, cy2) = self._anchor_canvas_pt2
+            if abs(cx2 - cx1) < 1e-9 or abs(cy2 - cy1) < 1e-9:
+                messagebox.showwarning(
+                    "Reference Points",
+                    "The two anchor clicks are too close in x or y. "
+                    "Pick clearly distinct points.")
+                self._begin_anchor_capture(self._reference_points)
+                return
+            ax = (ur_w[0] - ll_w[0]) / (cx2 - cx1)
+            bx = ll_w[0] - ax * cx1
+            ay = (ur_w[1] - ll_w[1]) / (cy2 - cy1)
+            by = ll_w[1] - ay * cy1
+
+            old_L, old_R, old_B, old_T = self._bg_extent
+            new_L = ax * old_L + bx
+            new_R = ax * old_R + bx
+            new_B = ay * old_B + by
+            new_T = ay * old_T + by
+            # Maintain canonical ordering xmin<xmax, ymin<ymax
+            if new_L > new_R:
+                new_L, new_R = new_R, new_L
+            if new_B > new_T:
+                new_B, new_T = new_T, new_B
+            self._bg_extent = [new_L, new_R, new_B, new_T]
+            self._reference_points = (ll_w, ur_w)
+
+            if self.model and self.model.source_path:
+                save_reference_points(self.model.source_path,
+                                      ll_w, ur_w)
+                self._save_bg_config()
+
+            self.status_var.set(
+                f"Floorplan aligned. LL=({ll_w[0]:g}, {ll_w[1]:g})  "
+                f"UR=({ur_w[0]:g}, {ur_w[1]:g})")
+            self._end_anchor_capture()
+            self.fit_to_extent()
+
+    def set_reference_points(self) -> None:
+        """Floor menu command: (re)capture the two reference anchors.
+
+        Reuses the same click-capture flow as the first-time floorplan
+        load. If a floorplan is already shown the user can simply click
+        the LL and UR anchors on it; otherwise the command warns.
+        """
+        if self.model is None or not self.model.source_path:
+            messagebox.showwarning("Reference Points",
+                                   "Open or save a file first.")
+            return
+        if self._bg_image is None:
+            messagebox.showwarning(
+                "Reference Points",
+                "Load a floorplan first (Floorplan → Load Floorplan...).")
+            return
+        # Force a re-capture of BOTH world coords by clearing any saved
+        # reference; the click handler will then ask for both.
+        self._reference_points = None
+        if self.model.source_path:
+            clear_reference_points(self.model.source_path)
+        self._begin_anchor_capture(None)
 
     def toggle_bg_resize_mode(self) -> None:
         if self._bg_image is None:
@@ -4674,21 +5761,73 @@ class IndoorGMLViewerApp:
     def _floor_ceiling_z(self, level: str) -> Tuple[float, float]:
         """Resolve (floor_z, ceiling_z) for a level.
 
-        Priority:
-          1. Existing cells on that floor (via `_get_floor_ceiling_z`).
-          2. User override registered by the New Floor dialog (meters).
+        Priority (FIXED — was reversed before):
+          1. User override registered by the New Floor dialog. This is
+             the most authoritative — the user explicitly told us what
+             the floor heights are.
+          2. Existing cells on that floor (via `_get_floor_ceiling_z`).
+             Only consulted when there is no override and at least one
+             cell on the level has a sensible Z.
           3. Hard default (0.0, 3.0) meters.
+
+        Why the priority change:
+        Older builds checked existing cells FIRST and the user override
+        SECOND. That meant if even ONE cell on the floor had a
+        corrupted z=0 (e.g. imported from a 2D-only IndoorGML, or left
+        over from a prior session that didn't have an override), every
+        subsequent New Cell / New Node on that floor inherited z=0 —
+        propagating the corruption forward. Honouring the user's
+        override first makes "I told you 2F is at 500" stick.
         """
-        # Check if any space already exists on this level — the module helper
-        # returns (0.0, 420.0) if nothing is found, so distinguish explicitly.
+        # 1) explicit user override
+        if level in self._floor_z_overrides:
+            return self._floor_z_overrides[level]
+        # 2) existing cells on that floor
         if self.model is not None:
             for sp in self.model.spaces.values():
                 if sp.level == level and sp.polygons_3d:
                     return _get_floor_ceiling_z(self.model, level)
-        # No cells yet — use user override if set
-        if level in self._floor_z_overrides:
-            return self._floor_z_overrides[level]
-        return 0.0, 3.0
+        # 3) hard default (cm)
+        return 0.0, 300.0
+
+    def new_floor_and_load_floorplan(self) -> None:
+        """Floorplan menu entry — create a brand-new floor and immediately
+        start the Load Floorplan flow on it.
+
+        Combines the existing New Floor dialog (floor name + Z heights)
+        with the click-anchor floorplan loader so the user can lay out a
+        fresh floor in one go: pick a name, pick the image, click two
+        reference anchors. The two reference points stay shared with all
+        the other floors so the new floor lands in the same coordinate
+        frame.
+        """
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
+        floors_before = set(get_available_floors(self.model))
+        # Capture the user's floor-Z overrides too — `new_floor` may add
+        # an entry there even before a CellSpace exists on the floor.
+        zovr_before = set(self._floor_z_overrides.keys())
+
+        self.new_floor()
+
+        floors_after = set(get_available_floors(self.model))
+        zovr_after = set(self._floor_z_overrides.keys())
+        added = list((floors_after | zovr_after) -
+                     (floors_before | zovr_before))
+        if not added:
+            # User cancelled the New Floor dialog — nothing to do.
+            return
+
+        # Switch to the new floor (new_floor already does this, but be
+        # defensive in case it failed) and chain into Load Floorplan.
+        new_name = added[0]
+        if new_name in self.floor_combo["values"]:
+            self.floor_var.set(new_name)
+        self.refresh_view()
+        # Invoke Load Floorplan automatically so the user goes straight
+        # into picking the image + clicking the two anchors.
+        self.load_background()
 
     def new_floor(self) -> None:
         """Create a new empty floor level and switch to it."""
@@ -4711,17 +5850,17 @@ class IndoorGMLViewerApp:
         name_entry.grid(row=0, column=1, padx=(0, 14), pady=(14, 4), sticky="w")
         name_entry.focus_set()
 
-        # Floor Z (m)
-        ttk.Label(dlg, text="Floor Z (m):").grid(
+        # Floor Z (cm)
+        ttk.Label(dlg, text="Floor Z (cm):").grid(
             row=1, column=0, padx=14, pady=4, sticky="w")
-        floor_z_var = tk.StringVar(value="0.0")
+        floor_z_var = tk.StringVar(value="0")
         ttk.Entry(dlg, textvariable=floor_z_var, width=22).grid(
             row=1, column=1, padx=(0, 14), pady=4, sticky="w")
 
-        # Ceiling Z (m)
-        ttk.Label(dlg, text="Ceiling Z (m):").grid(
+        # Ceiling Z (cm)
+        ttk.Label(dlg, text="Ceiling Z (cm):").grid(
             row=2, column=0, padx=14, pady=4, sticky="w")
-        ceiling_z_var = tk.StringVar(value="3.0")
+        ceiling_z_var = tk.StringVar(value="300")
         ttk.Entry(dlg, textvariable=ceiling_z_var, width=22).grid(
             row=2, column=1, padx=(0, 14), pady=4, sticky="w")
 
@@ -4749,7 +5888,7 @@ class IndoorGMLViewerApp:
                 fz = float(floor_z_var.get().strip())
                 cz = float(ceiling_z_var.get().strip())
             except ValueError:
-                warn_var.set("Floor Z / Ceiling Z must be numeric (meters).")
+                warn_var.set("Floor Z / Ceiling Z must be numeric (cm).")
                 return
             if cz <= fz:
                 warn_var.set("Ceiling Z must be greater than Floor Z.")
@@ -5032,6 +6171,11 @@ class IndoorGMLViewerApp:
         self._space_create_verts.clear()
         if self._space_create_preview_line is not None:
             self._space_create_preview_line.set_data([], [])
+        # New Cell (Rectangle)
+        self._rect_create_mode = False
+        if hasattr(self, "_rect_create_mode_var"):
+            self._rect_create_mode_var.set(False)
+        self._rect_create_pt1 = None
         # Cell Split
         self._split_mode = False
         self._split_mode_var.set(False)
@@ -5086,6 +6230,21 @@ class IndoorGMLViewerApp:
         if hasattr(self, "_ilc_mode_var"):
             self._ilc_mode_var.set(False)
         self._ilc_space1 = None
+        # Multi-cell bulk-apply modes (function code / class) — these
+        # also intercept every left click, so make them mutually
+        # exclusive with everything else.
+        if hasattr(self, "_multi_apply_mode"):
+            self._multi_apply_mode = False
+            self._multi_apply_selected.clear()
+            self._multi_apply_code = ""
+            if hasattr(self, "_multi_apply_mode_var"):
+                self._multi_apply_mode_var.set(False)
+        if hasattr(self, "_multi_class_mode"):
+            self._multi_class_mode = False
+            self._multi_class_selected.clear()
+            self._multi_class_value = ""
+            if hasattr(self, "_multi_class_mode_var"):
+                self._multi_class_mode_var.set(False)
 
     def toggle_edit_mode(self) -> None:
         self._clear_view_selection()
@@ -5326,6 +6485,8 @@ class IndoorGMLViewerApp:
             excluded_space_ids=excluded,
             show_nodes=self.show_nodes_var.get(),
             function_color_map=self._function_color_map or None,
+            function_label_map=(dict(self._function_codes)
+                                if self._function_codes else None),
             excluded_node_ids={node_id},
             bg_floor=self._bg_floor_from_combo(),
         )
@@ -5419,6 +6580,10 @@ class IndoorGMLViewerApp:
 
     def _do_view_select(self, xdata: float, ydata: float) -> None:
         """Hit-test at (xdata, ydata) with no edit mode active. Update _view_selected_*."""
+        # Any normal click clears the duplicate-id locate override so we
+        # use model-dict coords from now on.
+        self._view_selected_override_xy = None
+        self._view_selected_override_poly = None
         # Priority: node > edge > space
         node_id = self._find_node_near_graph(xdata, ydata)
         if node_id:
@@ -5451,10 +6616,28 @@ class IndoorGMLViewerApp:
         self.refresh_view()
 
     def _show_view_selection(self) -> None:
-        """Populate the Selection info panel for the currently selected item."""
+        """Populate the Selection info panel for the currently selected item.
+
+        While Cell Edit mode is active and a CellSpace is selected, the
+        panel switches to an editable form (Name / Class / Function) so
+        the user can change properties directly. Otherwise it shows the
+        read-only Text summary.
+        """
         if self._view_selected_type is None or self._view_selected_id is None or self.model is None:
             self._set_info_text("")
+            self._teardown_edit_form()
             return
+
+        # ── Editable form path: Cell Edit + CellSpace selected ──────
+        if (self._view_selected_type == "space"
+                and getattr(self, "_edit_mode", False)):
+            sp = self.model.spaces.get(self._view_selected_id)
+            if sp is not None:
+                self._build_space_edit_form(sp)
+                return
+        # If we previously had the form up, take it down before showing
+        # the read-only Text again.
+        self._teardown_edit_form()
 
         lines: List[str] = []
 
@@ -5494,6 +6677,15 @@ class IndoorGMLViewerApp:
                 return
             lines.append(f"[Node]")
             lines.append(f"ID:   {node.node_id}")
+            # Nodes themselves carry no `<name>` in IndoorGML; the
+            # human-readable label is the dual CellSpace's name. Show it
+            # so the Selection panel parity with CellSpace is complete.
+            dual_name = ""
+            if node.duality:
+                dual_sp = self.model.spaces.get(node.duality)
+                if dual_sp is not None:
+                    dual_name = dual_sp.name or ""
+            lines.append(f"Name: {dual_name or '—'}")
             if node.coord:
                 lines.append(f"x={node.coord[0]:.2f}")
                 lines.append(f"y={node.coord[1]:.2f}")
@@ -5545,45 +6737,331 @@ class IndoorGMLViewerApp:
 
     def _set_info_text(self, text: str) -> None:
         """Update the read-only info Text widget."""
+        # Make sure the read-only Text is the visible widget.
+        if (self._info_edit_frame is not None
+                and self._info_edit_frame.winfo_exists()):
+            self._info_edit_frame.pack_forget()
+        if (hasattr(self, "_info_text_frame")
+                and self._info_text_frame is not None):
+            try:
+                self._info_text_frame.pack_forget()
+                self._info_text_frame.pack(anchor="w", fill="both",
+                                           expand=True)
+            except Exception:
+                pass
         self._info_text.configure(state="normal")
         self._info_text.delete("1.0", "end")
         if text:
             self._info_text.insert("end", text)
         self._info_text.configure(state="disabled")
 
+    def _teardown_edit_form(self) -> None:
+        """Hide the editable form and restore the read-only Text view."""
+        if (self._info_edit_frame is not None
+                and self._info_edit_frame.winfo_exists()):
+            try:
+                self._info_edit_frame.destroy()
+            except Exception:
+                pass
+        self._info_edit_frame = None
+        # Re-show the Text widget container
+        if (hasattr(self, "_info_text_frame")
+                and self._info_text_frame is not None):
+            try:
+                self._info_text_frame.pack(anchor="w", fill="both",
+                                           expand=True)
+            except Exception:
+                pass
+
+    def _build_space_edit_form(self, sp: SpaceFeature) -> None:
+        """Replace the read-only Text with editable widgets for `sp`.
+
+        Shows: ID (read-only), Name, Class, Function (Combobox sourced
+        from the loaded function-codes CSV), Level (read-only),
+        Layer (read-only), POI (Checkbutton), Duality (read-only).
+
+        Changes are committed by the "Apply" button (or Enter in Name /
+        Class). The current cell's source_element is patched in place
+        so a subsequent Save preserves the edits, AND the in-memory
+        SpaceFeature is updated so the UI immediately reflects them.
+        """
+        # Hide read-only Text and remove any prior form
+        if (hasattr(self, "_info_text_frame")
+                and self._info_text_frame is not None):
+            try:
+                self._info_text_frame.pack_forget()
+            except Exception:
+                pass
+        if (self._info_edit_frame is not None
+                and self._info_edit_frame.winfo_exists()):
+            try:
+                self._info_edit_frame.destroy()
+            except Exception:
+                pass
+
+        f = ttk.Frame(self._info_outer, style="TB.TFrame")
+        f.pack(anchor="w", fill="both", expand=True)
+        self._info_edit_frame = f
+
+        small = ("TkDefaultFont", 9, "bold")
+        ttk.Label(f, text="[CellSpace]", style="TB.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        # ID — read-only
+        ttk.Label(f, text="ID:", style="TB.TLabel").grid(
+            row=1, column=0, sticky="e", padx=(0, 4))
+        ttk.Label(f, text=sp.feature_id, style="TB.TLabel").grid(
+            row=1, column=1, sticky="w")
+        # Name
+        ttk.Label(f, text="Name:", style="TB.TLabel").grid(
+            row=2, column=0, sticky="e", padx=(0, 4), pady=(4, 0))
+        name_var = tk.StringVar(value=sp.name or "")
+        name_entry = ttk.Entry(f, textvariable=name_var, width=22,
+                               font=small)
+        name_entry.grid(row=2, column=1, sticky="we", pady=(4, 0))
+        # Class
+        ttk.Label(f, text="Class:", style="TB.TLabel").grid(
+            row=3, column=0, sticky="e", padx=(0, 4))
+        cls_var = tk.StringVar(value=sp.cls or "")
+        ttk.Combobox(f, textvariable=cls_var,
+                     values=["CellSpace", "TransferSpace",
+                             "ConnectionSpace", "AnchorSpace"],
+                     width=20, font=small).grid(
+            row=3, column=1, sticky="we")
+        # Function — pull-down from loaded codes
+        ttk.Label(f, text="Func:", style="TB.TLabel").grid(
+            row=4, column=0, sticky="e", padx=(0, 4))
+        func_var = tk.StringVar(value=sp.function or "")
+        codes = [code for code, _ in self._function_codes] if \
+            getattr(self, "_function_codes", None) else []
+        # Make the Combobox readonly when codes are loaded so the user
+        # can only pick one of the official function codes; otherwise
+        # leave it free-form so they can still type a custom value.
+        func_state = "readonly" if codes else "normal"
+        # Show "code — label" for each entry while keeping the bare
+        # code as the underlying value the user picks.
+        if codes:
+            label_for = {code: label
+                         for code, label in self._function_codes}
+            display_values = [(f"{c} — {label_for[c]}"
+                               if label_for.get(c) and label_for[c] != c
+                               else c)
+                              for c in codes]
+            # Determine the visible string corresponding to current value
+            cur_disp = (
+                f"{sp.function} — {label_for[sp.function]}"
+                if (sp.function in label_for
+                    and label_for[sp.function] != sp.function)
+                else (sp.function or ""))
+            disp_var = tk.StringVar(value=cur_disp)
+            func_combo = ttk.Combobox(
+                f, textvariable=disp_var, values=display_values,
+                state=func_state, width=20, font=small)
+            func_combo.grid(row=4, column=1, sticky="we")
+
+            def _disp_to_code() -> str:
+                v = disp_var.get().strip()
+                if " — " in v:
+                    return v.split(" — ", 1)[0]
+                return v
+            self._sel_func_get_code = _disp_to_code
+        else:
+            ttk.Combobox(f, textvariable=func_var, values=codes,
+                         state=func_state, width=20, font=small).grid(
+                row=4, column=1, sticky="we")
+            self._sel_func_get_code = lambda: func_var.get().strip()
+
+        # Level (read-only — the floor combo controls level)
+        ttk.Label(f, text="Level:", style="TB.TLabel").grid(
+            row=5, column=0, sticky="e", padx=(0, 4))
+        ttk.Label(f, text=sp.level or "—", style="TB.TLabel").grid(
+            row=5, column=1, sticky="w")
+        # Layer (read-only)
+        ttk.Label(f, text="Layer:", style="TB.TLabel").grid(
+            row=6, column=0, sticky="e", padx=(0, 4))
+        if sp.layer_id:
+            lf = self.model.layers.get(sp.layer_id)
+            layer_str = (f"{sp.layer_id} ({lf.theme})" if lf
+                         else sp.layer_id)
+        else:
+            layer_str = "—"
+        ttk.Label(f, text=layer_str, style="TB.TLabel").grid(
+            row=6, column=1, sticky="w")
+        # POI checkbox
+        poi_var = tk.BooleanVar(value=getattr(sp, "is_poi", False))
+        ttk.Checkbutton(f, text="POI", variable=poi_var,
+                        style="TB.TCheckbutton").grid(
+            row=7, column=1, sticky="w", pady=(4, 0))
+        # Duality
+        ttk.Label(f, text="Node:", style="TB.TLabel").grid(
+            row=8, column=0, sticky="e", padx=(0, 4))
+        ttk.Label(f, text=sp.duality or "—", style="TB.TLabel").grid(
+            row=8, column=1, sticky="w")
+
+        f.columnconfigure(1, weight=1)
+
+        # Apply button — commits everything to the model + XML.
+        def _apply():
+            sp.name = name_var.get().strip()
+            sp.cls = cls_var.get().strip() or "CellSpace"
+            sp.function = self._sel_func_get_code()
+            sp.is_poi = bool(poi_var.get())
+            self._patch_cellspace_xml_props(sp)
+            self.refresh_view()
+            self.status_var.set(f"Updated CellSpace '{sp.feature_id}'.")
+
+        ttk.Button(f, text="Apply", style="TB.TButton",
+                   command=_apply).grid(
+            row=9, column=0, columnspan=2, pady=(6, 2), sticky="we")
+        # Enter on Name / Class also commits
+        name_entry.bind("<Return>", lambda _e: _apply())
+
+    def _patch_cellspace_xml_props(self, sp: SpaceFeature) -> None:
+        """Update the existing CellSpace element to match `sp`.
+
+        - `sp.name`     → `<cellSpaceName>` text
+        - `sp.function` → `<function>` text (element removed when blank)
+        - `sp.is_poi`   → `<poi>` text ("true" / "false")
+        - `sp.cls`      → ELEMENT TAG itself. IndoorGML 2.0 carries the
+                          subclass via the element local name
+                          (CellSpace / TransferSpace / ConnectionSpace /
+                          AnchorSpace), so a class change is a TAG
+                          rename, not a child-element update.
+
+        Newly-created cells (still in `_new_space_ids`) get the
+        up-to-date values emitted via `_add_new_spaces_to_xml` on Save,
+        so we can return early for those.
+        """
+        elem = sp.source_element
+        if elem is None or self.model is None or self.model.source_tree is None:
+            return                                # nothing to patch yet
+        ns = elem.tag.split("}")[0][1:] if "}" in elem.tag else ""
+        CORE = f"{{{ns}}}" if ns else ""
+
+        # 1) Class change → rewrite the element's tag in place.
+        cur_local = local_name(elem.tag)
+        new_local = (sp.cls or "CellSpace").strip() or "CellSpace"
+        if new_local != cur_local:
+            elem.tag = f"{CORE}{new_local}" if ns else new_local
+            # IndoorGML 2.0 wraps each space in either
+            # `<cellSpaceMember>` (for CellSpace) or
+            # `<transferSpaceMember>` etc.; don't try to retag the
+            # wrapper here — the parser/SPACE_TAG_HINTS already accept
+            # generic CellSpace-style elements regardless of wrapper.
+            sp.cls = new_local
+
+        def _get_or_make(tag_local: str) -> ET.Element:
+            for ch in elem:
+                if local_name(ch.tag) == tag_local:
+                    return ch
+            new = ET.SubElement(elem, f"{CORE}{tag_local}")
+            return new
+
+        # 2) Name → <cellSpaceName>
+        nm = _get_or_make("cellSpaceName")
+        nm.text = sp.name or ""
+        # 3) Function → <function>
+        if sp.function:
+            fn = _get_or_make("function")
+            fn.text = sp.function
+        else:
+            for ch in list(elem):
+                if local_name(ch.tag) == "function":
+                    elem.remove(ch)
+        # 4) POI → <poi>
+        poi = _get_or_make("poi")
+        poi.text = "true" if getattr(sp, "is_poi", False) else "false"
+
     def _draw_view_selection_overlay(self) -> None:
-        """Highlight the view-selected item on the canvas."""
-        # In split mode the split overlay handles visual feedback; suppress space highlight
+        """Highlight the view-selected item on the canvas.
+
+        The highlight uses a colour family (bright magenta + white) that
+        does NOT clash with any other rendering colour in the editor —
+        tomato (current-floor nodes), orange (downward vertical-edge
+        endpoints), dodgerblue (down-link node), deepskyblue (regular
+        edges), orchid / limegreen (vertical edges), yellow (measure /
+        first-vertex markers), cyan (vertical-edge first node) — so the
+        picked feature is always unambiguous, even on a busy floor.
+        """
         if self._split_mode:
             return
-        if self._view_selected_type is None or self._view_selected_id is None or self.model is None:
+        if (self._view_selected_type is None
+                or self._view_selected_id is None
+                or self.model is None):
             return
 
+        # Pick a center point so we can draw a crosshair across the
+        # current viewport, helping the user spot the highlight even on a
+        # very zoomed-out view.
+        cx = cy = None
+        ovr_xy   = self._view_selected_override_xy
+        ovr_poly = self._view_selected_override_poly
+
         if self._view_selected_type == "space":
-            sp = self.model.spaces.get(self._view_selected_id)
-            if sp and sp.polygons_3d:
-                poly = sp.polygons_3d[0]
-                xs = [p[0] for p in poly]
-                ys = [p[1] for p in poly]
-                if poly and poly[0] != poly[-1]:
-                    xs.append(poly[0][0])
-                    ys.append(poly[0][1])
-                self.ax.fill(xs, ys, color="yellow", alpha=0.20, zorder=3)
-                self.ax.plot(xs, ys, color="yellow", linewidth=2.0, zorder=4)
+            poly_xy: Optional[List[Tuple[float, float]]] = None
+            if ovr_poly:
+                poly_xy = list(ovr_poly)
+            else:
+                sp = self.model.spaces.get(self._view_selected_id)
+                if sp and sp.polygons_3d:
+                    poly_xy = [(p[0], p[1]) for p in sp.polygons_3d[0]]
+            if poly_xy:
+                xs = [p[0] for p in poly_xy]
+                ys = [p[1] for p in poly_xy]
+                if poly_xy and poly_xy[0] != poly_xy[-1]:
+                    xs.append(poly_xy[0][0])
+                    ys.append(poly_xy[0][1])
+                self.ax.fill(xs, ys, color="magenta", alpha=0.35, zorder=20)
+                self.ax.plot(xs, ys, color="white",   linewidth=4.5, zorder=21)
+                self.ax.plot(xs, ys, color="magenta", linewidth=2.5, zorder=22)
+                cx = sum(xs) / len(xs)
+                cy = sum(ys) / len(ys)
 
         elif self._view_selected_type == "node":
-            node = self.model.nodes.get(self._view_selected_id)
-            if node and node.coord:
-                self.ax.scatter([node.coord[0]], [node.coord[1]],
-                                color="yellow", s=80, zorder=8, marker="o",
-                                edgecolors="white", linewidths=1.0)
+            xy: Optional[Tuple[float, float]] = ovr_xy
+            if xy is None:
+                node = self.model.nodes.get(self._view_selected_id)
+                if node and node.coord:
+                    xy = (node.coord[0], node.coord[1])
+            if xy is not None:
+                cx, cy = xy
+                self.ax.scatter([cx], [cy], s=380, color="white",
+                                zorder=20, alpha=0.95)
+                self.ax.scatter([cx], [cy], s=320,
+                                facecolors="none", edgecolors="magenta",
+                                linewidths=3.0, zorder=21)
+                self.ax.scatter([cx], [cy], s=120, color="magenta",
+                                edgecolors="white", linewidths=1.5,
+                                zorder=22)
 
         elif self._view_selected_type == "edge":
-            edge = self.model.edges.get(self._view_selected_id)
-            if edge and len(edge.coords) >= 2:
-                xs = [p[0] for p in edge.coords]
-                ys = [p[1] for p in edge.coords]
-                self.ax.plot(xs, ys, color="yellow", linewidth=3.0, zorder=4, alpha=0.8)
+            line_xy: Optional[List[Tuple[float, float]]] = None
+            if ovr_poly:
+                line_xy = list(ovr_poly)
+            else:
+                edge = self.model.edges.get(self._view_selected_id)
+                if edge and len(edge.coords) >= 2:
+                    line_xy = [(p[0], p[1]) for p in edge.coords]
+            if line_xy and len(line_xy) >= 2:
+                xs = [p[0] for p in line_xy]
+                ys = [p[1] for p in line_xy]
+                self.ax.plot(xs, ys, color="white",   linewidth=6.0,
+                             zorder=20, alpha=0.95)
+                self.ax.plot(xs, ys, color="magenta", linewidth=3.0,
+                             zorder=21)
+                cx = sum(xs) / len(xs)
+                cy = sum(ys) / len(ys)
+
+        # Crosshair lines spanning the current viewport — make the
+        # selected feature trivially findable at any zoom level.
+        if cx is not None and cy is not None:
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+            self.ax.plot([xlim[0], xlim[1]], [cy, cy],
+                         color="magenta", linewidth=0.6, alpha=0.45,
+                         linestyle=":", zorder=19)
+            self.ax.plot([cx, cx], [ylim[0], ylim[1]],
+                         color="magenta", linewidth=0.6, alpha=0.45,
+                         linestyle=":", zorder=19)
 
     # ---- End view-only selection -------------------------------------------
 
@@ -5846,6 +7324,25 @@ class IndoorGMLViewerApp:
             self._space_create_mode_var.set(True)
             self._graph_edit_status_var.set(
                 "Left-click: add vertex | Double-click: finish | Right-click: cancel")
+        self.refresh_view()
+
+    def toggle_rect_create_mode(self) -> None:
+        """Toggle Rectangle-shortcut variant of New Cell.
+
+        Workflow: click TWO opposite corners — the editor builds a
+        4-vertex axis-aligned polygon between them and runs the same
+        save / dialog flow as the free-style polygon mode (so the cell
+        is stored exactly as a 4-point polygon in the IndoorGML XML).
+        """
+        self._clear_view_selection()
+        was_active = self._rect_create_mode
+        self._deactivate_all_edit_modes()
+        if not was_active:
+            self._rect_create_mode = True
+            self._rect_create_mode_var.set(True)
+            self._rect_create_pt1 = None
+            self._graph_edit_status_var.set(
+                "Rectangle: click first corner. (Right-click cancels.)")
         self.refresh_view()
 
     def _find_vertex_near_split_space(self, xdata: float, ydata: float):
@@ -6146,14 +7643,45 @@ class IndoorGMLViewerApp:
         else:
             floor_space_ids = get_space_ids_on_floor(self.model, floor)
             _, visible_ids, _ = expand_floor_graph(self.model, floor_space_ids, floor=floor)
-        # Always include newly created nodes (not connected to any floor space yet)
-        visible_ids |= self._new_node_ids
+            # Include session-new nodes too — but ONLY those that belong
+            # to the active floor. Force-including every new node would
+            # let the user's click on the canvas pick up an invisible
+            # node from a different floor and accidentally create a
+            # vertical edge spanning two floors (e.g. edge_new_188:
+            # node_new_76(4F) ↔ node_new_77(3F)).
+            for nid in self._new_node_ids:
+                n = self.model.nodes.get(nid)
+                if n is None:
+                    continue
+                if n.level == floor:
+                    visible_ids.add(nid)
         # Layer filter
         active_lid = self._layer_id_from_combo()
         if active_lid:
             visible_ids = {n for n in visible_ids
                            if self.model.nodes.get(n) and
                            self.model.nodes[n].layer_id == active_lid}
+
+        # Suppress nodes on floors strictly above the active floor — they
+        # are hidden in draw_on_axes (vertical-edge filter), so they must
+        # not be hit-testable either.
+        if floor and floor != "All":
+            cur_floor_z: Optional[float] = None
+            for s_id in floor_space_ids:
+                sp = self.model.spaces.get(s_id)
+                if sp is not None and sp.polygons_3d:
+                    cur_floor_z = sp.polygons_3d[0][0][2]
+                    break
+            if cur_floor_z is not None:
+                kept: Set[str] = set()
+                for nid in visible_ids:
+                    n = self.model.nodes.get(nid)
+                    if n is None or n.coord is None:
+                        kept.add(nid)
+                        continue
+                    if (n.level == floor) or n.coord[2] <= cur_floor_z:
+                        kept.add(nid)
+                visible_ids = kept
 
         # Use pixel-space threshold (20px) — independent of zoom level
         PIXEL_THRESHOLD = 30.0
@@ -6216,31 +7744,50 @@ class IndoorGMLViewerApp:
         return best
 
     def _create_node(self, x: float, y: float) -> str:
+        # Collect ids in BOTH the in-memory model AND the source XML tree
+        # so we don't reuse an id that was previously saved + then undone
+        # (the model dropped it but the XML element still exists, and
+        # picking the same id would yield two Node elements with the same
+        # id on next save).
         existing = set(self.model.nodes.keys())
+        if self.model.source_tree is not None:
+            for elem in self.model.source_tree.getroot().iter():
+                if local_name(elem.tag) == "Node":
+                    for k, v in elem.attrib.items():
+                        if local_name(k) == "id":
+                            existing.add(v)
+                            break
         i = 1
         while f"node_new_{i}" in existing:
             i += 1
         nid = f"node_new_{i}"
         current_floor = self.floor_var.get()
         level = None if current_floor == "All" else current_floor
-        # Use Z value from existing nodes on the same floor
+        # Derive Z from the *CellSpaces* on this floor, NOT from any node.
+        # Reason: expand_floor_graph() pulls in off-floor vertical-edge
+        # endpoints; picking z_vals[0] from that set could grab the Z of a
+        # node on a different floor and silently leave the new node with
+        # `level=current_floor` but `z=other-floor-z`. CellSpace polygons
+        # on a floor always share the same Z, so they are the authority.
         z = 0.0
         if level:
-            floor_space_ids = get_space_ids_on_floor(self.model, level)
-            _, floor_node_ids, _ = expand_floor_graph(self.model, floor_space_ids, floor=level)
-            z_vals = [
-                self.model.nodes[nid].coord[2]
-                for nid in floor_node_ids
-                if nid in self.model.nodes and self.model.nodes[nid].coord is not None
-            ]
-            if z_vals:
-                z = z_vals[0]
+            for sp in self.model.spaces.values():
+                if sp.level == level and sp.polygons_3d:
+                    z = sp.polygons_3d[0][0][2]
+                    break
             else:
-                # fallback: any node's Z
-                all_z = [n.coord[2] for n in self.model.nodes.values() if n.coord is not None]
-                z = all_z[0] if all_z else 0.0
+                # No space exists on this floor yet (newly created floor).
+                fz = self._floor_z_overrides.get(level)
+                if fz is not None:
+                    z = fz[0]
+                else:
+                    # Last-resort fallback: any node's Z (legacy behaviour).
+                    all_z = [n.coord[2] for n in self.model.nodes.values()
+                             if n.coord is not None]
+                    z = all_z[0] if all_z else 0.0
         else:
-            z_vals = [n.coord[2] for n in self.model.nodes.values() if n.coord is not None]
+            z_vals = [n.coord[2] for n in self.model.nodes.values()
+                      if n.coord is not None]
             z = z_vals[0] if z_vals else 0.0
         self.model.nodes[nid] = NodeFeature(
             node_id=nid, coord=(x, y, z), level=level,
@@ -6300,19 +7847,58 @@ class IndoorGMLViewerApp:
         if self._graph_drag_node == node_id:
             self._graph_drag_node = None
 
-    def _create_edge(self, node1_id: str, node2_id: str) -> Optional[str]:
+    def _create_edge(self, node1_id: str, node2_id: str,
+                     allow_cross_floor: bool = False) -> Optional[str]:
+        """Create an Edge between two existing nodes.
+
+        Returns the new edge id, or None if the edge already exists.
+
+        Cross-floor guard: by default this function REFUSES to connect
+        two nodes whose levels differ (or whose Z values differ by more
+        than 50 mm) — even if the caller computed otherwise — and pops
+        an error dialog instead. This stops a bad hit-test from
+        silently creating a vertical edge that the user never intended.
+        Vertical Edge mode legitimately needs cross-floor edges and
+        passes ``allow_cross_floor=True`` to opt out of the guard.
+        """
         for edge in self.model.edges.values():
             conns = set(edge.connects)
             if node1_id in conns and node2_id in conns:
                 return None
+
+        n1 = self.model.nodes.get(node1_id)
+        n2 = self.model.nodes.get(node2_id)
+
+        # ---- Cross-floor safety guard --------------------------------
+        if not allow_cross_floor and n1 is not None and n2 is not None:
+            same_level = (n1.level == n2.level
+                          and n1.level is not None)
+            same_z = False
+            if n1.coord is not None and n2.coord is not None:
+                same_z = abs(n1.coord[2] - n2.coord[2]) < 50.0
+            if not (same_level or same_z):
+                lv1 = n1.level or "?"
+                lv2 = n2.level or "?"
+                z1 = n1.coord[2] if n1.coord else None
+                z2 = n2.coord[2] if n2.coord else None
+                messagebox.showwarning(
+                    "Edge refused",
+                    f"Refusing to create an edge between nodes on "
+                    f"different floors:\n"
+                    f"  {node1_id}  (level {lv1}, z={z1})\n"
+                    f"  {node2_id}  (level {lv2}, z={z2})\n\n"
+                    "If you intended a vertical edge, switch to "
+                    "Network → Vertical Edge mode.")
+                return None
+        # --------------------------------------------------------------
+
         existing = set(self.model.edges.keys())
         i = 1
         while f"edge_new_{i}" in existing:
             i += 1
         eid = f"edge_new_{i}"
-        n1 = self.model.nodes.get(node1_id)
-        n2 = self.model.nodes.get(node2_id)
-        coords = [c for c in [n1.coord if n1 else None, n2.coord if n2 else None] if c is not None]
+        coords = [c for c in [n1.coord if n1 else None,
+                              n2.coord if n2 else None] if c is not None]
         self.model.edges[eid] = EdgeFeature(
             edge_id=eid, coords=coords, connects=[node1_id, node2_id],
             layer_id=self._layer_id_from_combo() or "",
@@ -6719,6 +8305,1660 @@ class IndoorGMLViewerApp:
 
         tree.bind("<Double-1>", _go)
 
+    def find_duplicate_ids(self) -> None:
+        """Scan the source XML tree for any feature element (Node, Edge,
+        CellSpace, …) that appears more than once with the same id.
+
+        Reports each duplicate group, the number of copies and a brief
+        signature for each copy (Z value for nodes, vertex count for cells).
+        Includes a "Clean up" button that removes the surplus copies,
+        keeping the first occurrence and binding the model's
+        `source_element` to it. Run Save afterwards to persist the cleanup.
+        """
+        if self.model is None or self.model.source_tree is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
+
+        TARGET_LOCAL_NAMES = {
+            "Node", "Edge", "CellSpace", "ThematicLayer",
+            "PrimalSpaceLayer", "DualSpaceLayer",
+            "InterLayerConnection",
+        }
+
+        # Collect (kind, id) -> list of element refs
+        from collections import defaultdict as _dd
+        by_id: Dict[Tuple[str, str], List[ET.Element]] = _dd(list)
+        root = self.model.source_tree.getroot()
+        for elem in root.iter():
+            ln = local_name(elem.tag)
+            if ln not in TARGET_LOCAL_NAMES:
+                continue
+            for k, v in elem.attrib.items():
+                if local_name(k) == "id":
+                    by_id[(ln, v)].append(elem)
+                    break
+
+        # Sort priority: Node first (rarest, most concerning), then Edge,
+        # then CellSpace, then layer-level metadata. This way the user
+        # never has to scroll past hundreds of Edge entries to discover a
+        # single Node collision.
+        _KIND_ORDER = {
+            "Node": 0, "Edge": 1, "CellSpace": 2,
+            "InterLayerConnection": 3,
+            "ThematicLayer": 4,
+            "PrimalSpaceLayer": 5, "DualSpaceLayer": 6,
+        }
+        dup_groups = [(kind, fid, elems)
+                      for (kind, fid), elems in by_id.items()
+                      if len(elems) >= 2]
+        dup_groups.sort(key=lambda t: (_KIND_ORDER.get(t[0], 99), t[1]))
+
+        # Reuse-or-recreate a single non-modal dialog
+        existing = getattr(self, "_dup_id_dlg", None)
+        if existing is not None and existing.winfo_exists():
+            try:
+                existing.destroy()
+            except Exception:
+                pass
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Duplicate IDs")
+        dlg.geometry("720x520")
+        try:
+            dlg.transient(self.root)
+        except Exception:
+            pass
+        self._dup_id_dlg = dlg
+
+        # Header / summary
+        summary_var = tk.StringVar()
+        ttk.Label(dlg, textvariable=summary_var,
+                  font=("TkDefaultFont", 9, "bold"))\
+            .pack(anchor="w", padx=8, pady=(8, 4))
+
+        body = ttk.Frame(dlg)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+        tree = ttk.Treeview(
+            body,
+            columns=("kind", "id", "copy", "signature"),
+            show="tree headings", selectmode="extended", height=18)
+        tree.heading("#0",        text="")          # tree column for grouping
+        tree.heading("kind",      text="Kind")
+        tree.heading("id",        text="ID")
+        tree.heading("copy",      text="Copy")
+        tree.heading("signature", text="Signature")
+        tree.column("#0",        width=24,  stretch=False)
+        tree.column("kind",      width=110, anchor="w")
+        tree.column("id",        width=220, anchor="w")
+        tree.column("copy",      width=60,  anchor="center")
+        tree.column("signature", width=280, anchor="w")
+        tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=sb.set)
+
+        # Per-row → element map so we can act on the picked copy
+        row_to_elem: Dict[str, ET.Element] = {}
+        row_to_kind_id: Dict[str, Tuple[str, str]] = {}
+
+        def _signature(elem: ET.Element) -> str:
+            """Short per-copy descriptor so you can tell duplicates apart."""
+            ln = local_name(elem.tag)
+            if ln == "Node":
+                for sub in elem.iter():
+                    if local_name(sub.tag) == "pos" and sub.text:
+                        parts = sub.text.strip().split()
+                        if len(parts) >= 3:
+                            return f"z={parts[2]}"
+                        if len(parts) == 2:
+                            return f"xy=({parts[0]},{parts[1]})"
+                return "(no pos)"
+            if ln == "Edge":
+                for sub in elem.iter():
+                    if local_name(sub.tag) == "pos" and sub.text:
+                        parts = sub.text.strip().split()
+                        if len(parts) >= 3:
+                            return f"first z={parts[2]}"
+                        return f"first pos={sub.text.strip()}"
+                return "(no pos)"
+            if ln == "CellSpace":
+                vc = sum(1 for s in elem.iter()
+                         if local_name(s.tag) == "pos")
+                lvl = ""
+                for sub in elem:
+                    if local_name(sub.tag) == "level" and sub.text:
+                        lvl = sub.text.strip()
+                        break
+                return f"{vc} pos | level={lvl or '?'}"
+            return ""
+
+        def _populate():
+            tree.delete(*tree.get_children())
+            row_to_elem.clear()
+            row_to_kind_id.clear()
+            for kind, fid, elems in dup_groups:
+                # Group header row (no element bound)
+                gid = tree.insert(
+                    "", "end",
+                    values=(kind, fid, f"{len(elems)} copies", ""),
+                    open=True)
+                # One child row per copy — each is individually selectable
+                for i, e in enumerate(elems, start=1):
+                    rid = tree.insert(
+                        gid, "end",
+                        values=("", "", f"#{i}", _signature(e)))
+                    row_to_elem[rid] = e
+                    row_to_kind_id[rid] = (kind, fid)
+            total_extra = sum(len(es) - 1 for _, _, es in dup_groups)
+            # Per-kind breakdown so the user immediately sees how many of
+            # each type are affected.
+            from collections import Counter as _Counter
+            kind_counts = _Counter(k for k, _, _ in dup_groups)
+            breakdown = ", ".join(
+                f"{kind_counts[k]} {k}" for k in
+                ("Node", "Edge", "CellSpace",
+                 "InterLayerConnection", "ThematicLayer",
+                 "PrimalSpaceLayer", "DualSpaceLayer")
+                if kind_counts.get(k))
+            head = f"{len(dup_groups)} duplicate group(s)"
+            if breakdown:
+                head += f"  [{breakdown}]"
+            summary_var.set(
+                f"{head} — {total_extra} surplus element(s). "
+                "Pick a row, then 'Locate' to verify or "
+                "'Delete this copy' to remove just that element.")
+
+        _populate()
+
+        # Footer with action buttons
+        footer = ttk.Frame(dlg)
+        footer.pack(fill="x", padx=8, pady=8)
+
+        def _on_close():
+            self._dup_id_dlg = None
+            dlg.destroy()
+        ttk.Button(footer, text="Close",
+                   command=_on_close).pack(side="right")
+
+        def _rescan():
+            dup_groups.clear()
+            by_id2: Dict[Tuple[str, str], List[ET.Element]] = _dd(list)
+            for elem in root.iter():
+                ln = local_name(elem.tag)
+                if ln not in TARGET_LOCAL_NAMES:
+                    continue
+                for k, v in elem.attrib.items():
+                    if local_name(k) == "id":
+                        by_id2[(ln, v)].append(elem)
+                        break
+            dup_groups.extend(
+                (kind, fid, elems)
+                for (kind, fid), elems in by_id2.items()
+                if len(elems) >= 2
+            )
+            dup_groups.sort(key=lambda t: (t[0], t[1]))
+            _populate()
+
+        # ---- Locate the picked copy on the canvas (preview only) ----
+        def _locate_picked():
+            sel = tree.selection()
+            if not sel or sel[0] not in row_to_elem:
+                return
+            elem = row_to_elem[sel[0]]
+            kind, fid = row_to_kind_id[sel[0]]
+
+            # Pull every <pos> in this element so we can both (a) place
+            # the highlight on the picked copy's own coordinates and (b)
+            # decide which floor to switch to. The model dict only holds
+            # one of the duplicates' coords — using the picked copy's
+            # `<pos>` directly is what makes the two duplicates show in
+            # different places when the user clicks them in turn.
+            poly_xy: List[Tuple[float, float]] = []
+            cz: Optional[float] = None
+            level_text: Optional[str] = None
+            for sub in elem.iter():
+                ln = local_name(sub.tag)
+                if ln == "level" and sub.text:
+                    level_text = sub.text.strip()
+                elif ln == "pos" and sub.text:
+                    parts = sub.text.strip().split()
+                    if len(parts) >= 2:
+                        try:
+                            poly_xy.append((float(parts[0]), float(parts[1])))
+                            if len(parts) >= 3 and cz is None:
+                                cz = float(parts[2])
+                        except ValueError:
+                            pass
+
+            # Resolve target floor — explicit <level> > Z-coord match.
+            target_floor = level_text
+            if (not target_floor
+                    or target_floor not in self.floor_combo["values"]):
+                if cz is not None:
+                    floor_z = {sp.level: sp.polygons_3d[0][0][2]
+                               for sp in self.model.spaces.values()
+                               if sp.level and sp.polygons_3d}
+                    if floor_z:
+                        target_floor = min(floor_z.keys(),
+                                           key=lambda k: abs(floor_z[k]-cz))
+            if target_floor and target_floor in self.floor_combo["values"]:
+                self.floor_var.set(target_floor)
+
+            if poly_xy:
+                cx = sum(p[0] for p in poly_xy) / len(poly_xy)
+                cy = sum(p[1] for p in poly_xy) / len(poly_xy)
+                xlim = self.ax.get_xlim(); ylim = self.ax.get_ylim()
+                w = abs(xlim[1]-xlim[0]) * 0.5 or 5.0
+                h = abs(ylim[1]-ylim[0]) * 0.5 or 5.0
+                self.ax.set_xlim(cx-w/2, cx+w/2)
+                self.ax.set_ylim(cy-h/2, cy+h/2)
+                self._view_locked = True
+
+            # Drive the magenta-crosshair highlight at the picked copy's
+            # exact coords by setting the *override* fields. This is what
+            # makes duplicate #1 and duplicate #2 light up at *different*
+            # spots even though the model dict points at only one of them.
+            self._view_selected_override_xy   = None
+            self._view_selected_override_poly = None
+            if kind == "Node":
+                self._view_selected_type = "node"
+                self._view_selected_id   = fid
+                if poly_xy:
+                    self._view_selected_override_xy = poly_xy[0]
+                if fid in self.model.nodes:
+                    self.model.nodes[fid].source_element = elem
+            elif kind == "CellSpace":
+                self._view_selected_type = "space"
+                self._view_selected_id   = fid
+                if poly_xy:
+                    self._view_selected_override_poly = poly_xy
+                if fid in self.model.spaces:
+                    self.model.spaces[fid].source_element = elem
+            elif kind == "Edge":
+                self._view_selected_type = "edge"
+                self._view_selected_id   = fid
+                if poly_xy:
+                    self._view_selected_override_poly = poly_xy
+                if fid in self.model.edges:
+                    self.model.edges[fid].source_element = elem
+            self.refresh_view()
+
+        # ---- Delete *only* the picked copy ----
+        def _delete_one(row_id, parent_of):
+            """Delete a single picked copy. `parent_of` is a precomputed
+            element→parent map (so we don't rebuild it per call when
+            deleting many rows in bulk). Returns the number of
+            cascade-deleted edges, or None on failure."""
+            if row_id not in row_to_elem:
+                return None
+            elem = row_to_elem[row_id]
+            kind, fid = row_to_kind_id[row_id]
+            removed = False
+            p = parent_of.get(elem)
+            if p is not None:
+                gp = parent_of.get(p)
+                wrapper_local = local_name(p.tag)
+                if (gp is not None and wrapper_local in (
+                        "nodeMember", "edgeMember", "cellSpaceMember")):
+                    try:
+                        gp.remove(p); removed = True
+                    except ValueError:
+                        pass
+                if not removed:
+                    try:
+                        p.remove(elem); removed = True
+                    except ValueError:
+                        pass
+
+            # Helper: read the z value of the *first* <pos> in an element
+            def _first_z(e: ET.Element) -> Optional[float]:
+                for sub in e.iter():
+                    if local_name(sub.tag) == "pos" and sub.text:
+                        parts = sub.text.strip().split()
+                        if len(parts) >= 3:
+                            try:
+                                return float(parts[2])
+                            except ValueError:
+                                return None
+                return None
+
+            Z_EPS = 50.0  # mm — same tolerance used elsewhere
+
+            cascaded_edges = 0
+            survivors: List[ET.Element] = []
+            survivor_zs: List[float] = []
+            deleted_z: Optional[float] = None
+            if removed:
+                deleted_z = _first_z(elem)
+                for k_, fid_, elems_ in dup_groups:
+                    if k_ == kind and fid_ == fid:
+                        survivors = [e for e in elems_ if e is not elem]
+                        survivor_zs = [_first_z(e) for e in survivors
+                                       if _first_z(e) is not None]
+                        break
+
+                if survivors:
+                    # Re-bind model to one of the survivors so the in-memory
+                    # representation stays valid.
+                    keep = survivors[0]
+                    if kind == "Node" and fid in self.model.nodes:
+                        self.model.nodes[fid].source_element = keep
+                    elif kind == "Edge" and fid in self.model.edges:
+                        self.model.edges[fid].source_element = keep
+                    elif (kind == "CellSpace"
+                          and fid in self.model.spaces):
+                        self.model.spaces[fid].source_element = keep
+
+                # ----- Cascade-delete decisions per kind -----
+                if kind == "Node":
+                    # An edge "physically belongs to" the deleted copy
+                    # when one of its endpoints matches the deleted copy's
+                    # FULL (x, y, z). Earlier we matched z only, but that
+                    # wrongly cascaded any same-floor edge that referenced
+                    # `fid` — even ones that physically connected to a
+                    # different node sharing the same z. Tighten to exact
+                    # XYZ to keep unrelated edges intact.
+                    deleted_xy: Optional[Tuple[float, float]] = None
+                    for sub_ in elem.iter():
+                        if (local_name(sub_.tag) == "pos"
+                                and sub_.text):
+                            parts = sub_.text.strip().split()
+                            if len(parts) >= 2:
+                                try:
+                                    deleted_xy = (float(parts[0]),
+                                                  float(parts[1]))
+                                except ValueError:
+                                    pass
+                            break
+                    XY_EPS_DEL = 0.5  # mm
+
+                    no_survivor_at_z = (
+                        deleted_z is None
+                        or all(abs(z - deleted_z) >= Z_EPS
+                               for z in survivor_zs)
+                    )
+                    if no_survivor_at_z:
+                        edges_to_del: List[str] = []
+                        for eid, e in self.model.edges.items():
+                            if fid not in e.connects:
+                                continue
+                            if not e.coords:
+                                continue
+                            if deleted_z is None or deleted_xy is None:
+                                edges_to_del.append(eid)
+                                continue
+                            # Edge must have an endpoint whose full
+                            # (x, y, z) matches the deleted copy.
+                            def _ep_match(pt):
+                                return (abs(pt[0] - deleted_xy[0]) < XY_EPS_DEL
+                                        and abs(pt[1] - deleted_xy[1]) < XY_EPS_DEL
+                                        and abs(pt[2] - deleted_z) < Z_EPS)
+                            if _ep_match(e.coords[0]) or _ep_match(e.coords[-1]):
+                                edges_to_del.append(eid)
+                        for eid in edges_to_del:
+                            edge = self.model.edges.pop(eid, None)
+                            self._new_edge_ids.discard(eid)
+                            cascaded_edges += 1
+                            if edge is not None and edge.source_element is not None:
+                                ep = parent_of.get(edge.source_element)
+                                if ep is not None:
+                                    epp = parent_of.get(ep)
+                                    if (epp is not None
+                                            and local_name(ep.tag)
+                                            == "edgeMember"):
+                                        try:
+                                            epp.remove(ep)
+                                        except ValueError:
+                                            pass
+                                    else:
+                                        try:
+                                            ep.remove(edge.source_element)
+                                        except ValueError:
+                                            pass
+                        if not survivors:
+                            self.model.nodes.pop(fid, None)
+                            self._new_node_ids.discard(fid)
+                elif kind == "Edge" and not survivors:
+                    self.model.edges.pop(fid, None)
+                    self._new_edge_ids.discard(fid)
+                elif kind == "CellSpace" and not survivors:
+                    self.model.spaces.pop(fid, None)
+                    self._new_space_ids.discard(fid)
+
+            if not removed:
+                return None
+            return cascaded_edges
+
+        def _delete_picked():
+            """Delete every selected duplicate-copy row. Multi-select
+            (Ctrl/Shift click in the tree, or marquee) is supported —
+            each row is removed in turn under one confirmation dialog."""
+            sels = list(tree.selection())
+            sels = [s for s in sels if s in row_to_elem]
+            if not sels:
+                messagebox.showinfo(
+                    "Delete this copy",
+                    "Pick one or more specific copy row(s) "
+                    "(under a duplicate group) first.",
+                    parent=dlg)
+                return
+            if len(sels) == 1:
+                elem = row_to_elem[sels[0]]
+                kind, fid = row_to_kind_id[sels[0]]
+                sig = _signature(elem)
+                msg = (f"Remove this copy of {kind} '{fid}'?\n"
+                       f"  signature: {sig}\n\n"
+                       "The other duplicate(s) will remain. "
+                       "Save the file afterwards to persist.")
+            else:
+                preview = "\n".join(
+                    f"  • {row_to_kind_id[s][0]} '{row_to_kind_id[s][1]}'"
+                    f"  ({_signature(row_to_elem[s])})"
+                    for s in sels[:10])
+                more = "" if len(sels) <= 10 else f"\n  … +{len(sels)-10} more"
+                msg = (f"Remove {len(sels)} selected copies?\n\n"
+                       f"{preview}{more}\n\n"
+                       "Save the file afterwards to persist.")
+            if not messagebox.askyesno("Delete this copy", msg, parent=dlg):
+                return
+
+            parent_of: Dict[ET.Element, ET.Element] = {}
+            for parent in root.iter():
+                for child in parent:
+                    parent_of[child] = parent
+
+            total_removed = 0
+            total_cascaded = 0
+            for row in sels:
+                r = _delete_one(row, parent_of)
+                if r is not None:
+                    total_removed += 1
+                    total_cascaded += r
+            if total_removed == 0:
+                messagebox.showwarning(
+                    "Delete this copy",
+                    "Could not remove the element(s) (already detached?).",
+                    parent=dlg)
+            else:
+                if total_cascaded:
+                    messagebox.showinfo(
+                        "Delete this copy",
+                        f"Removed {total_removed} copy(ies). "
+                        f"{total_cascaded} dangling edge(s) were "
+                        f"cascade-deleted.\nSave the file to persist.",
+                        parent=dlg)
+                _rescan()
+                self.refresh_view()
+
+        # ---- Rename the picked copy to a fresh, unused id ----
+        def _rename_picked():
+            sel = tree.selection()
+            if not sel or sel[0] not in row_to_elem:
+                messagebox.showinfo(
+                    "Rename ID",
+                    "Pick a specific copy row (under a duplicate group) "
+                    "first.", parent=dlg)
+                return
+            elem = row_to_elem[sel[0]]
+            kind, fid = row_to_kind_id[sel[0]]
+
+            # Build the set of EVERY existing id of this kind in the
+            # source tree so we can suggest / validate a unique new id.
+            existing_ids: Set[str] = set()
+            target_ln = kind   # "Node" / "Edge" / "CellSpace" / ...
+            for e_ in root.iter():
+                if local_name(e_.tag) == target_ln:
+                    for k_, v_ in e_.attrib.items():
+                        if local_name(k_) == "id":
+                            existing_ids.add(v_)
+                            break
+
+            # Default suggestion: append "_2", "_3", … until unique.
+            base = fid
+            i = 2
+            while f"{base}_{i}" in existing_ids:
+                i += 1
+            default_new_id = f"{base}_{i}"
+
+            # Modal sub-dialog asking for the new id.
+            sub = tk.Toplevel(dlg)
+            sub.title("Rename ID")
+            sub.resizable(False, False)
+            sub.grab_set()
+            ttk.Label(sub, text=f"Renaming this {kind} copy of "
+                              f"'{fid}'.").grid(
+                row=0, column=0, columnspan=2, padx=10, pady=(10, 4),
+                sticky="w")
+            ttk.Label(sub, text="New ID:").grid(
+                row=1, column=0, padx=10, pady=4, sticky="e")
+            id_var = tk.StringVar(value=default_new_id)
+            entry = ttk.Entry(sub, textvariable=id_var, width=36)
+            entry.grid(row=1, column=1, padx=(0, 10), pady=4, sticky="w")
+            entry.focus_set()
+            entry.select_range(0, "end")
+
+            confirmed_new_id: List[str] = []
+            def _ok():
+                v = id_var.get().strip()
+                if not v:
+                    messagebox.showwarning(
+                        "Rename ID", "Enter a non-empty ID.", parent=sub)
+                    return
+                if v == fid:
+                    messagebox.showwarning(
+                        "Rename ID",
+                        "New ID equals the current ID — nothing to do.",
+                        parent=sub)
+                    return
+                if v in existing_ids:
+                    messagebox.showwarning(
+                        "Rename ID",
+                        f"'{v}' already exists in this file.", parent=sub)
+                    return
+                confirmed_new_id.append(v)
+                sub.destroy()
+            ttk.Button(sub, text="OK", command=_ok).grid(
+                row=2, column=0, pady=10)
+            ttk.Button(sub, text="Cancel",
+                       command=sub.destroy).grid(row=2, column=1, pady=10)
+            sub.bind("<Return>", lambda e: _ok())
+            sub.bind("<Escape>", lambda e: sub.destroy())
+            sub.wait_window()
+
+            if not confirmed_new_id:
+                return
+            new_id = confirmed_new_id[0]
+
+            # Apply the rename — update the id attribute of the picked
+            # element AND update connects-references that physically
+            # belong to this copy (matched by z), so the renamed copy
+            # keeps its incident edges.
+            id_changed = False
+            for k_ in list(elem.attrib.keys()):
+                if local_name(k_) == "id":
+                    elem.attrib[k_] = new_id
+                    id_changed = True
+                    break
+            if not id_changed:
+                messagebox.showwarning(
+                    "Rename ID",
+                    "Could not locate the id attribute on this element.",
+                    parent=dlg)
+                return
+
+            # For Nodes, also reattach the edges that physically belong
+            # to this copy (endpoint z matches this copy's z and at most
+            # one survivor sits at the same z).
+            reattached_edges = 0
+            if kind == "Node":
+                this_z: Optional[float] = None
+                for sub_ in elem.iter():
+                    if local_name(sub_.tag) == "pos" and sub_.text:
+                        parts = sub_.text.strip().split()
+                        if len(parts) >= 3:
+                            try:
+                                this_z = float(parts[2])
+                            except ValueError:
+                                pass
+                        break
+
+                # Find sibling copies still at the same z — if any, we
+                # cannot uniquely reassign edges, so leave them alone.
+                same_z_sibling = False
+                if this_z is not None:
+                    for k_, fid_, elems_ in dup_groups:
+                        if k_ == "Node" and fid_ == fid:
+                            for e_ in elems_:
+                                if e_ is elem:
+                                    continue
+                                for sub_ in e_.iter():
+                                    if (local_name(sub_.tag) == "pos"
+                                            and sub_.text):
+                                        parts = sub_.text.strip().split()
+                                        if len(parts) >= 3:
+                                            try:
+                                                z_ = float(parts[2])
+                                            except ValueError:
+                                                continue
+                                            if abs(z_ - this_z) < 50.0:
+                                                same_z_sibling = True
+                                        break
+                            break
+
+                # Pull the renamed copy's exact (x, y) so we can match
+                # edges that GEOMETRICALLY end at this node — the previous
+                # version retargeted any edge whose endpoint shared the
+                # same z, which wrongly modified every same-floor edge
+                # whose connects happened to reference `fid`. That bug
+                # produced cross-floor edges like
+                #   edge_new_732 connects=[node_new_262, node_new_266]
+                # whose <gml:pos> values were both at z=3695.
+                this_xy: Optional[Tuple[float, float]] = None
+                if this_z is not None:
+                    for sub_ in elem.iter():
+                        if (local_name(sub_.tag) == "pos"
+                                and sub_.text):
+                            parts = sub_.text.strip().split()
+                            if len(parts) >= 2:
+                                try:
+                                    this_xy = (float(parts[0]),
+                                               float(parts[1]))
+                                except ValueError:
+                                    pass
+                            break
+
+                XY_EPS = 0.5  # mm — coordinates are typically integers
+                if (this_z is not None and this_xy is not None
+                        and not same_z_sibling):
+                    # Walk every Edge in the tree; only retarget when an
+                    # edge has an ENDPOINT (first or last <pos>) whose
+                    # full (x, y, z) matches the renamed copy's pos —
+                    # i.e. the edge is geometrically incident on this
+                    # specific node, not merely on any node at the same
+                    # floor.
+                    for e_elem in root.iter():
+                        if local_name(e_elem.tag) != "Edge":
+                            continue
+                        edge_pts: List[Tuple[float, float, float]] = []
+                        for sub_ in e_elem.iter():
+                            if (local_name(sub_.tag) == "pos"
+                                    and sub_.text):
+                                parts = sub_.text.strip().split()
+                                if len(parts) >= 3:
+                                    try:
+                                        edge_pts.append((
+                                            float(parts[0]),
+                                            float(parts[1]),
+                                            float(parts[2])))
+                                    except ValueError:
+                                        pass
+                        if len(edge_pts) < 2:
+                            continue
+
+                        def _match(pt: Tuple[float, float, float]) -> bool:
+                            return (abs(pt[0] - this_xy[0]) < XY_EPS
+                                    and abs(pt[1] - this_xy[1]) < XY_EPS
+                                    and abs(pt[2] - this_z) < 50.0)
+
+                        if not (_match(edge_pts[0])
+                                or _match(edge_pts[-1])):
+                            continue
+                        # Geometrically incident on this exact node →
+                        # retarget the connects href that names `fid`.
+                        for ce in e_elem:
+                            if local_name(ce.tag) != "connects":
+                                continue
+                            for ak, av in list(ce.attrib.items()):
+                                if (local_name(ak) == "href"
+                                        and av.lstrip("#") == fid):
+                                    ce.attrib[ak] = f"#{new_id}"
+                                    reattached_edges += 1
+                        # Sync the in-memory edge.connects so editor
+                        # logic stays consistent with the XML.
+                        eid_attr: Optional[str] = None
+                        for ak, av in e_elem.attrib.items():
+                            if local_name(ak) == "id":
+                                eid_attr = av
+                                break
+                        if eid_attr and eid_attr in self.model.edges:
+                            edge = self.model.edges[eid_attr]
+                            edge.connects = [
+                                new_id if c == fid else c
+                                for c in edge.connects
+                            ]
+
+            # Update the model's per-id dicts: insert renamed copy as a
+            # fresh entry; the original id keeps its surviving copy.
+            if kind == "Node":
+                # Detach a NodeFeature for the new id from the renamed
+                # element (parse coord & duality from the element).
+                nx = ny = nz = 0.0
+                for sub_ in elem.iter():
+                    if local_name(sub_.tag) == "pos" and sub_.text:
+                        parts = sub_.text.strip().split()
+                        if len(parts) >= 2:
+                            try:
+                                nx = float(parts[0]); ny = float(parts[1])
+                                if len(parts) >= 3:
+                                    nz = float(parts[2])
+                            except ValueError:
+                                pass
+                        break
+                duality = ""
+                for sub_ in elem.iter():
+                    if local_name(sub_.tag) == "duality":
+                        for ak, av in sub_.attrib.items():
+                            if local_name(ak) == "href" and av:
+                                duality = av.lstrip("#")
+                                break
+                        break
+                new_node = NodeFeature(
+                    node_id=new_id, coord=(nx, ny, nz),
+                    source_element=elem, duality=duality,
+                    layer_id=(self.model.nodes[fid].layer_id
+                              if fid in self.model.nodes else ""),
+                )
+                self.model.nodes[new_id] = new_node
+            elif kind == "Edge" and fid in self.model.edges:
+                # Move the EdgeFeature reference to new id (edge.connects
+                # endpoints don't change here).
+                edge = self.model.edges.pop(fid, None)
+                if edge is not None:
+                    edge.edge_id = new_id
+                    edge.source_element = elem
+                    self.model.edges[new_id] = edge
+            elif kind == "CellSpace" and fid in self.model.spaces:
+                sp = self.model.spaces.pop(fid, None)
+                if sp is not None:
+                    sp.feature_id = new_id
+                    sp.source_element = elem
+                    self.model.spaces[new_id] = sp
+            self.model.invalidate_floor_index()
+
+            messagebox.showinfo(
+                "Rename ID",
+                f"'{fid}' → '{new_id}' applied to this copy.\n"
+                + (f"{reattached_edges} edge connects-reference(s) "
+                   f"updated to point at the renamed copy.\n"
+                   if reattached_edges else "")
+                + "Save the file to persist.",
+                parent=dlg)
+            _rescan()
+            self.refresh_view()
+
+        ttk.Button(footer, text="Delete this copy",
+                   command=_delete_picked).pack(side="right", padx=(0, 6))
+        ttk.Button(footer, text="Rename ID...",
+                   command=_rename_picked).pack(side="right", padx=(0, 6))
+        ttk.Button(footer, text="Locate selected",
+                   command=_locate_picked).pack(side="right", padx=(0, 6))
+        # Press Delete (or Backspace) on the tree to remove the selected
+        # copy without reaching for the button.
+        tree.bind("<Delete>",    lambda _e: _delete_picked())
+        tree.bind("<BackSpace>", lambda _e: _delete_picked())
+        dlg.bind("<Delete>",     lambda _e: _delete_picked())
+        dlg.bind("<BackSpace>",  lambda _e: _delete_picked())
+
+        # Double-click on a copy row → locate (preview only, no destructive
+        # action). Locate uses the picked element's own coords, not model's,
+        # so each duplicate can be inspected independently.
+        tree.bind("<Double-1>", lambda _e: _locate_picked())
+
+    def _open_check_list_dialog(self,
+                                title: str,
+                                rows: List[Tuple[str, str, str, str]],
+                                kind: str,
+                                rescan_fn) -> None:
+        """Generic non-modal list dialog used by `find_nodes_without_duality`
+        and `find_cells_without_node`. Each row tuple is
+        (id, level, name_or_blank, signature).
+        `kind` is "node" or "space" — drives Locate / Delete behaviour.
+        `rescan_fn` returns a fresh list of rows.
+        """
+        existing = getattr(self, "_check_list_dlg", None)
+        if existing is not None and existing.winfo_exists():
+            try:
+                existing.destroy()
+            except Exception:
+                pass
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.geometry("680x520")
+        try:
+            dlg.transient(self.root)
+        except Exception:
+            pass
+        self._check_list_dlg = dlg
+
+        summary_var = tk.StringVar()
+        ttk.Label(dlg, textvariable=summary_var,
+                  font=("TkDefaultFont", 9, "bold"))\
+            .pack(anchor="w", padx=8, pady=(8, 4))
+
+        body = ttk.Frame(dlg)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+        tree = ttk.Treeview(
+            body,
+            columns=("level", "id", "name", "signature"),
+            show="headings", selectmode="extended", height=18)
+        tree.heading("level",     text="Floor")
+        tree.heading("id",        text="ID")
+        tree.heading("name",      text="Name")
+        tree.heading("signature", text="Note")
+        tree.column("level",     width=60,  anchor="w")
+        tree.column("id",        width=240, anchor="w")
+        tree.column("name",      width=180, anchor="w")
+        tree.column("signature", width=180, anchor="w")
+        tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=sb.set)
+
+        def _populate(data):
+            tree.delete(*tree.get_children())
+            for fid, lv, nm, sig in data:
+                tree.insert("", "end", values=(lv, fid, nm, sig))
+            summary_var.set(f"{len(data)} entry(ies). "
+                            "Double-click to locate; "
+                            "Delete button removes the selected one.")
+        _populate(rows)
+
+        def _go(_evt=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            lv, fid, _, _ = tree.item(sel[0], "values")
+            if lv and lv != "?" and lv in self.floor_combo["values"]:
+                self.floor_var.set(lv)
+            cx = cy = None
+            if kind == "node":
+                n = self.model.nodes.get(fid)
+                if n and n.coord:
+                    cx, cy = n.coord[0], n.coord[1]
+                self._view_selected_type = "node"
+                self._view_selected_id   = fid
+            else:
+                sp = self.model.spaces.get(fid)
+                if sp and sp.polygons_3d:
+                    xs = [p[0] for p in sp.polygons_3d[0]]
+                    ys = [p[1] for p in sp.polygons_3d[0]]
+                    if xs and ys:
+                        cx = sum(xs)/len(xs); cy = sum(ys)/len(ys)
+                self._view_selected_type = "space"
+                self._view_selected_id   = fid
+            self._view_selected_override_xy = None
+            self._view_selected_override_poly = None
+            if cx is not None and cy is not None:
+                xlim = self.ax.get_xlim(); ylim = self.ax.get_ylim()
+                w = abs(xlim[1]-xlim[0]) * 0.5 or 5.0
+                h = abs(ylim[1]-ylim[0]) * 0.5 or 5.0
+                self.ax.set_xlim(cx-w/2, cx+w/2)
+                self.ax.set_ylim(cy-h/2, cy+h/2)
+                self._view_locked = True
+            self.refresh_view()
+        tree.bind("<Double-1>", _go)
+
+        def _delete_one(fid):
+            """Delete a single node/space without re-prompting."""
+            if kind == "node":
+                node = self.model.nodes.pop(fid, None)
+                self._new_node_ids.discard(fid)
+                # Cascade-delete edges referencing this node id
+                edges_to_del = [eid for eid, e in self.model.edges.items()
+                                if fid in e.connects]
+                for eid in edges_to_del:
+                    edge = self.model.edges.pop(eid, None)
+                    self._new_edge_ids.discard(eid)
+                    if (edge is not None
+                            and edge.source_element is not None
+                            and self.model.source_tree is not None):
+                        root_ = self.model.source_tree.getroot()
+                        parent_of: Dict[ET.Element, ET.Element] = {}
+                        for parent in root_.iter():
+                            for child in parent:
+                                parent_of[child] = parent
+                        ep = parent_of.get(edge.source_element)
+                        if ep is not None:
+                            epp = parent_of.get(ep)
+                            if (epp is not None
+                                    and local_name(ep.tag) == "edgeMember"):
+                                try: epp.remove(ep)
+                                except ValueError: pass
+                            else:
+                                try: ep.remove(edge.source_element)
+                                except ValueError: pass
+                # Remove the node element from XML
+                if (node is not None
+                        and node.source_element is not None
+                        and self.model.source_tree is not None):
+                    root_ = self.model.source_tree.getroot()
+                    parent_of: Dict[ET.Element, ET.Element] = {}
+                    for parent in root_.iter():
+                        for child in parent:
+                            parent_of[child] = parent
+                    target = node.source_element
+                    p = parent_of.get(target)
+                    if p is not None:
+                        gp = parent_of.get(p)
+                        if (gp is not None
+                                and local_name(p.tag) == "nodeMember"):
+                            try: gp.remove(p)
+                            except ValueError: pass
+                        else:
+                            try: p.remove(target)
+                            except ValueError: pass
+                # Drop the auto-generated VS dual cell, if any
+                vs_id = f"VS_{fid}"
+                if vs_id in self.model.spaces:
+                    self.model.spaces.pop(vs_id, None)
+                    self._new_space_ids.discard(vs_id)
+            else:                                   # space
+                sp = self.model.spaces.pop(fid, None)
+                self._new_space_ids.discard(fid)
+                if (sp is not None
+                        and sp.source_element is not None
+                        and self.model.source_tree is not None):
+                    root_ = self.model.source_tree.getroot()
+                    parent_of: Dict[ET.Element, ET.Element] = {}
+                    for parent in root_.iter():
+                        for child in parent:
+                            parent_of[child] = parent
+                    target = sp.source_element
+                    p = parent_of.get(target)
+                    if p is not None:
+                        gp = parent_of.get(p)
+                        if (gp is not None
+                                and local_name(p.tag) == "cellSpaceMember"):
+                            try: gp.remove(p)
+                            except ValueError: pass
+                        else:
+                            try: p.remove(target)
+                            except ValueError: pass
+
+        def _delete():
+            """Delete every selected row in one go (multi-select via
+            Ctrl/Shift click in the tree, or marquee)."""
+            sels = list(tree.selection())
+            if not sels:
+                messagebox.showinfo("Delete", "Pick one or more rows first.",
+                                    parent=dlg)
+                return
+            ids = [tree.item(s, "values")[1] for s in sels]
+            if len(ids) == 1:
+                msg = (f"Remove this {kind} '{ids[0]}'?\n"
+                       "Save the file to persist.")
+            else:
+                preview = "\n".join(f"  • {x}" for x in ids[:10])
+                more = "" if len(ids) <= 10 else f"\n  … +{len(ids)-10} more"
+                msg = (f"Remove {len(ids)} {kind}(s)?\n\n"
+                       f"{preview}{more}\n\nSave the file to persist.")
+            if not messagebox.askyesno("Delete", msg, parent=dlg):
+                return
+            for fid in ids:
+                _delete_one(fid)
+            _populate(rescan_fn())
+            self.refresh_view()
+
+        footer = ttk.Frame(dlg)
+        footer.pack(fill="x", padx=8, pady=8)
+        ttk.Button(footer, text="Delete",
+                   command=_delete).pack(side="right", padx=(0, 6))
+        ttk.Button(footer, text="Refresh",
+                   command=lambda: _populate(rescan_fn())
+                   ).pack(side="right", padx=(0, 6))
+        ttk.Button(footer, text="Close",
+                   command=dlg.destroy).pack(side="right")
+        # Delete key shortcut on the tree / dialog
+        tree.bind("<Delete>",    lambda _e: _delete())
+        tree.bind("<BackSpace>", lambda _e: _delete())
+        dlg.bind("<Delete>",     lambda _e: _delete())
+        dlg.bind("<BackSpace>",  lambda _e: _delete())
+
+    def find_nodes_without_duality(self) -> None:
+        """List Nodes whose `<duality>` href is empty or points at a
+        CellSpace that does not exist in the model."""
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
+
+        def _scan():
+            rows: List[Tuple[str, str, str, str]] = []
+            for nid, n in self.model.nodes.items():
+                d = (n.duality or "").strip()
+                if not d:
+                    note = "duality empty"
+                elif d not in self.model.spaces:
+                    note = f"dangling → '{d}'"
+                else:
+                    continue                   # ok
+                rows.append((nid, n.level or "?", "", note))
+            rows.sort(key=lambda r: (r[1], r[0]))
+            return rows
+
+        self._open_check_list_dialog(
+            "Nodes without Duality",
+            _scan(),
+            kind="node",
+            rescan_fn=_scan,
+        )
+
+    def find_cells_without_node(self) -> None:
+        """List CellSpaces whose `<duality>` href is empty or points at a
+        Node that does not exist in the model.
+
+        Virtual cells (auto-created `VS_*` for standalone nodes) are
+        included ONLY if they're orphans — i.e. their dual node was
+        deleted leaving the cell behind. A virtual cell whose dual
+        relationship is intact is excluded since "missing duality" is
+        the expected state for a freshly-created VS that the editor
+        will fill in on save.
+        """
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
+
+        def _scan():
+            rows: List[Tuple[str, str, str, str]] = []
+            # Index of which space ids are pointed at by some node's
+            # duality — used to skip "healthy" virtual cells.
+            spaces_pointed_at: Set[str] = {
+                n.duality for n in self.model.nodes.values() if n.duality
+            }
+            for sid, sp in self.model.spaces.items():
+                d = (sp.duality or "").strip()
+                if not d:
+                    note = "duality empty"
+                elif d not in self.model.nodes:
+                    note = f"dangling → '{d}'"
+                else:
+                    continue                          # healthy
+                # If this is a virtual cell whose dual node DOES point
+                # back at it, it's healthy from the node side — skip it
+                # (the "missing duality" on the cell side is harmless).
+                is_vs = (sp.feature_id.startswith("VS_")
+                         and not sp.polygons_3d) or getattr(
+                             sp, "is_virtual", False)
+                if is_vs and sid in spaces_pointed_at:
+                    continue
+                # Tag orphan virtual cells in the note for clarity.
+                if is_vs:
+                    note = f"orphan VS — {note}"
+                rows.append((sid, sp.level or "?", sp.name or "", note))
+            rows.sort(key=lambda r: (r[1], r[0]))
+            return rows
+
+        self._open_check_list_dialog(
+            "Cells without Dual Node",
+            _scan(),
+            kind="space",
+            rescan_fn=_scan,
+        )
+
+    def normalize_floor_z(self) -> None:
+        """Force every cell + node on each floor onto its canonical
+        floor / ceiling Z. Useful for files in which some elements lost
+        their Z (e.g. saved as z=0 by an older converter).
+
+        The dialog asks for a `Floor Z` AND a `Ceiling Z` per level so
+        the cells get a real 3D extrusion (floor ring at floor_z,
+        ceiling ring at ceiling_z, walls regenerated on save). Nodes
+        are placed at floor_z and edge endpoint Z values follow the
+        node Z.
+        """
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
+
+        from collections import Counter as _Counter
+        floors = sorted({sp.level for sp in self.model.spaces.values()
+                         if sp.level})
+        if not floors:
+            messagebox.showinfo("Normalize Floor Z",
+                                "No floor information found.")
+            return
+
+        # ── Build proposals (floor_z, ceiling_z) per level ──────────
+        proposals: Dict[str, Tuple[float, float]] = {}
+        for fl in floors:
+            ovr = self._floor_z_overrides.get(fl)
+            if ovr is not None and len(ovr) >= 2:
+                proposals[fl] = (float(ovr[0]), float(ovr[1]))
+                continue
+            # Most common non-zero floor and ceiling Z among existing
+            # cells; if everything is zero, default the ceiling to
+            # floor + 3000 mm.
+            f_zs, c_zs = [], []
+            for sp in self.model.spaces.values():
+                if sp.level != fl or not sp.polygons_3d:
+                    continue
+                f_zs.append(sp.polygons_3d[0][0][2])
+                if len(sp.polygons_3d) >= 2:
+                    c_zs.append(sp.polygons_3d[1][0][2])
+            def _pick(zs: List[float], default: float) -> float:
+                if not zs:
+                    return default
+                non_zero = [z for z in zs if z != 0]
+                ctr = _Counter(non_zero or zs)
+                return float(ctr.most_common(1)[0][0])
+            f_pick = _pick(f_zs, 0.0)
+            c_pick = _pick(c_zs, f_pick + 300.0)
+            if c_pick <= f_pick:
+                c_pick = f_pick + 300.0
+            proposals[fl] = (f_pick, c_pick)
+
+        # ── Dialog ──────────────────────────────────────────────────
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Normalize Floor Z")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        ttk.Label(dlg,
+                  text=("Set canonical Floor Z and Ceiling Z (cm) for "
+                        "each level.\nEvery cell on that level will be "
+                        "rebuilt with floor ring @ Floor Z and\n"
+                        "ceiling ring @ Ceiling Z; nodes move to Floor Z."),
+                  justify="left").grid(
+            row=0, column=0, columnspan=4, padx=12, pady=(12, 8),
+            sticky="w")
+        ttk.Label(dlg, text="Floor",
+                  font=("TkDefaultFont", 9, "bold")
+                  ).grid(row=1, column=0, padx=(12, 4), pady=2, sticky="e")
+        ttk.Label(dlg, text="Floor Z (cm)",
+                  font=("TkDefaultFont", 9, "bold")
+                  ).grid(row=1, column=1, padx=4, pady=2, sticky="w")
+        ttk.Label(dlg, text="Ceiling Z (cm)",
+                  font=("TkDefaultFont", 9, "bold")
+                  ).grid(row=1, column=2, padx=4, pady=2, sticky="w")
+        ttk.Label(dlg, text="Current",
+                  font=("TkDefaultFont", 9, "bold")
+                  ).grid(row=1, column=3, padx=(4, 12), pady=2, sticky="w")
+
+        f_vars: Dict[str, tk.StringVar] = {}
+        c_vars: Dict[str, tk.StringVar] = {}
+        for i, fl in enumerate(floors):
+            ttk.Label(dlg, text=fl).grid(
+                row=2 + i, column=0, padx=(12, 4), pady=2, sticky="e")
+            fv = tk.StringVar(value=f"{proposals[fl][0]:g}")
+            cv = tk.StringVar(value=f"{proposals[fl][1]:g}")
+            f_vars[fl] = fv; c_vars[fl] = cv
+            ttk.Entry(dlg, textvariable=fv, width=11,
+                      font=("TkDefaultFont", 9, "bold")).grid(
+                row=2 + i, column=1, padx=4, pady=2, sticky="w")
+            ttk.Entry(dlg, textvariable=cv, width=11,
+                      font=("TkDefaultFont", 9, "bold")).grid(
+                row=2 + i, column=2, padx=4, pady=2, sticky="w")
+            f_zs = []; c_zs = []
+            for sp in self.model.spaces.values():
+                if sp.level != fl or not sp.polygons_3d:
+                    continue
+                f_zs.append(sp.polygons_3d[0][0][2])
+                if len(sp.polygons_3d) >= 2:
+                    c_zs.append(sp.polygons_3d[1][0][2])
+            cur_f = ", ".join(f"{z:g}×{c}"
+                              for z, c in sorted(_Counter(f_zs).items()))
+            cur_c = ", ".join(f"{z:g}×{c}"
+                              for z, c in sorted(_Counter(c_zs).items()))
+            cur_summary = f"floor[{cur_f or '—'}]  ceil[{cur_c or '—'}]"
+            ttk.Label(dlg, text=cur_summary, foreground="#666",
+                      font=("TkDefaultFont", 8)).grid(
+                row=2 + i, column=3, padx=(4, 12), pady=2, sticky="w")
+
+        confirmed = [False]
+        def _ok():
+            for fl in floors:
+                try:
+                    fz = float(f_vars[fl].get().strip())
+                    cz = float(c_vars[fl].get().strip())
+                except ValueError:
+                    messagebox.showwarning(
+                        "Normalize Floor Z",
+                        f"Floor '{fl}': both Z values must be numbers.",
+                        parent=dlg)
+                    return
+                if cz <= fz:
+                    messagebox.showwarning(
+                        "Normalize Floor Z",
+                        f"Floor '{fl}': Ceiling Z ({cz}) must be greater "
+                        f"than Floor Z ({fz}).", parent=dlg)
+                    return
+            confirmed[0] = True
+            dlg.destroy()
+        btn = ttk.Frame(dlg)
+        btn.grid(row=2 + len(floors), column=0, columnspan=4, pady=10)
+        ttk.Button(btn, text="OK", command=_ok).pack(side="left", padx=4)
+        ttk.Button(btn, text="Cancel", command=dlg.destroy
+                   ).pack(side="left", padx=4)
+        dlg.wait_window()
+        if not confirmed[0]:
+            return
+
+        targets: Dict[str, Tuple[float, float]] = {
+            fl: (float(f_vars[fl].get().strip()),
+                 float(c_vars[fl].get().strip()))
+            for fl in floors
+        }
+
+        # ── Apply ───────────────────────────────────────────────────
+        n_cells = 0
+        n_nodes = 0
+        for sp in self.model.spaces.values():
+            if not sp.level or sp.level not in targets:
+                continue
+            fz, cz = targets[sp.level]
+            if not sp.polygons_3d:
+                continue
+            # Reduce to (floor_ring, ceiling_ring) — walls regenerate
+            # on save from `_add_new_spaces_to_xml`. Pull (x, y) from
+            # the EXISTING floor ring so the footprint is preserved.
+            base_ring = sp.polygons_3d[0]
+            new_floor_ring = [(x, y, fz) for x, y, _ in base_ring]
+            new_ceil_ring  = [(x, y, cz) for x, y, _ in base_ring]
+            if (sp.polygons_3d[0] != new_floor_ring
+                    or (len(sp.polygons_3d) >= 2
+                        and sp.polygons_3d[1] != new_ceil_ring)
+                    or len(sp.polygons_3d) > 2):
+                sp.polygons_3d = [new_floor_ring, new_ceil_ring]
+                if sp.centers:
+                    sp.centers = [(c[0], c[1], fz) for c in sp.centers]
+                # Force the writer to regenerate the geometry block
+                sp.source_element = None
+                self._new_space_ids.add(sp.feature_id)
+                # Persist the override so future New Cell on this floor
+                # uses the right Z without needing a per-cell touch-up.
+                self._floor_z_overrides[sp.level] = (fz, cz)
+                n_cells += 1
+        for n in self.model.nodes.values():
+            if not n.level or n.level not in targets or n.coord is None:
+                continue
+            fz, _ = targets[n.level]
+            if n.coord[2] != fz:
+                n.coord = (n.coord[0], n.coord[1], fz)
+                n.source_element = None
+                self._new_node_ids.add(n.node_id)
+                n_nodes += 1
+        # Re-sync edge endpoint Z to follow node Z
+        for e in self.model.edges.values():
+            if not e.coords or len(e.coords) < 2:
+                continue
+            new_coords = list(e.coords)
+            for i, ep_id in enumerate(e.connects[:2]):
+                node = self.model.nodes.get(ep_id)
+                if node is None or node.coord is None:
+                    continue
+                idx = 0 if i == 0 else -1
+                old = new_coords[idx]
+                if old[2] != node.coord[2]:
+                    new_coords[idx] = (old[0], old[1], node.coord[2])
+            if new_coords != list(e.coords):
+                e.coords = new_coords
+                e.source_element = None
+                self._new_edge_ids.add(e.edge_id)
+
+        # Save the new overrides so the next session uses them too
+        for fl, (fz, cz) in targets.items():
+            self._floor_z_overrides[fl] = (fz, cz)
+
+        messagebox.showinfo(
+            "Normalize Floor Z",
+            f"Updated {n_cells} CellSpace(s) and {n_nodes} Node(s).\n"
+            "Save the file to persist.")
+        self.refresh_view()
+
+    def find_duality_conflicts(self) -> None:
+        """List places where the IndoorGML 2.0 1:1 cell ↔ node duality
+        is broken:
+
+        1. Multiple cells claim the SAME node as their dual
+           (e.g. ``VS_node_new_210`` + ``door_new_13`` both have
+           ``<duality href="#node_new_210">``).
+        2. Multiple nodes claim the SAME cell as their dual.
+        3. Asymmetric duality — cell → node but node → some other cell
+           (or vice versa).
+
+        Typical cause for case 1: a standalone node was given an auto
+        ``VS_*`` virtual cell, and later a real cell (door / space)
+        was created that took over the duality. The leftover
+        ``VS_*`` becomes a duality conflict.
+        """
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
+
+        # Reuse-or-recreate dialog handle
+        existing = getattr(self, "_dual_conflict_dlg", None)
+        if existing is not None and existing.winfo_exists():
+            try:
+                existing.destroy()
+            except Exception:
+                pass
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Duality Conflicts")
+        dlg.geometry("780x520")
+        try:
+            dlg.transient(self.root)
+        except Exception:
+            pass
+        self._dual_conflict_dlg = dlg
+
+        summary_var = tk.StringVar()
+        ttk.Label(dlg, textvariable=summary_var,
+                  font=("TkDefaultFont", 9, "bold"))\
+            .pack(anchor="w", padx=8, pady=(8, 4))
+
+        body = ttk.Frame(dlg)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+        tree = ttk.Treeview(
+            body,
+            columns=("kind", "id", "level", "info"),
+            show="tree headings", selectmode="extended", height=18)
+        tree.heading("#0",    text="")
+        tree.heading("kind",  text="Conflict")
+        tree.heading("id",    text="ID")
+        tree.heading("level", text="Floor")
+        tree.heading("info",  text="Detail")
+        tree.column("#0",    width=24,  stretch=False)
+        tree.column("kind",  width=180, anchor="w")
+        tree.column("id",    width=240, anchor="w")
+        tree.column("level", width=60,  anchor="w")
+        tree.column("info",  width=240, anchor="w")
+        tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=sb.set)
+
+        row_to_target: Dict[str, Tuple[str, str]] = {}   # row → (kind, id)
+
+        def _scan_and_populate():
+            tree.delete(*tree.get_children())
+            row_to_target.clear()
+
+            from collections import defaultdict as _dd
+
+            # Case 1: nodes referenced by ≥ 2 cells
+            cells_per_node: Dict[str, List[str]] = _dd(list)
+            for sid, sp in self.model.spaces.items():
+                if sp.duality:
+                    cells_per_node[sp.duality].append(sid)
+            shared_nodes = [(nid, sids) for nid, sids in cells_per_node.items()
+                            if len(sids) >= 2 and nid in self.model.nodes]
+            shared_nodes.sort(key=lambda t: (-len(t[1]), t[0]))
+
+            # Case 2: cells referenced by ≥ 2 nodes
+            nodes_per_cell: Dict[str, List[str]] = _dd(list)
+            for nid, n in self.model.nodes.items():
+                if n.duality:
+                    nodes_per_cell[n.duality].append(nid)
+            shared_cells = [(sid, nids) for sid, nids in nodes_per_cell.items()
+                            if len(nids) >= 2 and sid in self.model.spaces]
+            shared_cells.sort(key=lambda t: (-len(t[1]), t[0]))
+
+            # Case 3: asymmetric — cell.duality = N but N.duality != cell
+            asym_cell_to_node: List[Tuple[str, str, str]] = []
+            for sid, sp in self.model.spaces.items():
+                if not sp.duality or sp.duality not in self.model.nodes:
+                    continue
+                n = self.model.nodes[sp.duality]
+                if n.duality != sid:
+                    asym_cell_to_node.append(
+                        (sid, sp.duality, n.duality or ""))
+            asym_cell_to_node.sort(key=lambda t: t[0])
+
+            # Populate tree
+            if shared_nodes:
+                hdr = tree.insert(
+                    "", "end",
+                    values=(f"Multi-cell → 1 node ({len(shared_nodes)})",
+                            "", "", ""), open=True)
+                for nid, sids in shared_nodes:
+                    n = self.model.nodes.get(nid)
+                    sub = tree.insert(
+                        hdr, "end",
+                        values=("", nid, n.level if n else "?",
+                                f"{len(sids)} cells: {', '.join(sids)}"))
+                    row_to_target[sub] = ("node", nid)
+                    for sid in sids:
+                        sp = self.model.spaces.get(sid)
+                        c = tree.insert(
+                            sub, "end",
+                            values=("",
+                                    f"   ↳ cell {sid}",
+                                    sp.level if sp else "?",
+                                    "duality → " + nid))
+                        row_to_target[c] = ("space", sid)
+
+            if shared_cells:
+                hdr = tree.insert(
+                    "", "end",
+                    values=(f"Multi-node → 1 cell ({len(shared_cells)})",
+                            "", "", ""), open=True)
+                for sid, nids in shared_cells:
+                    sp = self.model.spaces.get(sid)
+                    sub = tree.insert(
+                        hdr, "end",
+                        values=("", sid, sp.level if sp else "?",
+                                f"{len(nids)} nodes: {', '.join(nids)}"))
+                    row_to_target[sub] = ("space", sid)
+                    for nid in nids:
+                        n = self.model.nodes.get(nid)
+                        c = tree.insert(
+                            sub, "end",
+                            values=("",
+                                    f"   ↳ node {nid}",
+                                    n.level if n else "?",
+                                    "duality → " + sid))
+                        row_to_target[c] = ("node", nid)
+
+            if asym_cell_to_node:
+                hdr = tree.insert(
+                    "", "end",
+                    values=(f"Asymmetric duality "
+                            f"({len(asym_cell_to_node)})",
+                            "", "", ""), open=True)
+                for sid, nid, n_dual in asym_cell_to_node:
+                    sp = self.model.spaces.get(sid)
+                    detail = (f"cell→{nid}, but node→"
+                              + (n_dual if n_dual else "(empty)"))
+                    sub = tree.insert(
+                        hdr, "end",
+                        values=("", sid, sp.level if sp else "?", detail))
+                    row_to_target[sub] = ("space", sid)
+
+            total = (len(shared_nodes) + len(shared_cells)
+                     + len(asym_cell_to_node))
+            summary_var.set(
+                f"{total} duality conflict group(s) — "
+                f"{len(shared_nodes)} multi-cell→1node, "
+                f"{len(shared_cells)} multi-node→1cell, "
+                f"{len(asym_cell_to_node)} asymmetric.")
+
+        _scan_and_populate()
+
+        # Footer
+        footer = ttk.Frame(dlg)
+        footer.pack(fill="x", padx=8, pady=8)
+
+        def _go():
+            sel = tree.selection()
+            if not sel or sel[0] not in row_to_target:
+                return
+            kind, fid = row_to_target[sel[0]]
+            if kind == "node" and fid in self.model.nodes:
+                n = self.model.nodes[fid]
+                if n.coord:
+                    if n.level and n.level in self.floor_combo["values"]:
+                        self.floor_var.set(n.level)
+                    cx, cy = n.coord[0], n.coord[1]
+                    xlim = self.ax.get_xlim(); ylim = self.ax.get_ylim()
+                    w = abs(xlim[1]-xlim[0]) * 0.5 or 5.0
+                    h = abs(ylim[1]-ylim[0]) * 0.5 or 5.0
+                    self.ax.set_xlim(cx-w/2, cx+w/2)
+                    self.ax.set_ylim(cy-h/2, cy+h/2)
+                    self._view_locked = True
+                self._view_selected_type = "node"
+                self._view_selected_id = fid
+            elif kind == "space" and fid in self.model.spaces:
+                sp = self.model.spaces[fid]
+                if sp.polygons_3d:
+                    xs = [p[0] for p in sp.polygons_3d[0]]
+                    ys = [p[1] for p in sp.polygons_3d[0]]
+                    if xs:
+                        cx = sum(xs)/len(xs); cy = sum(ys)/len(ys)
+                        if sp.level and sp.level in self.floor_combo["values"]:
+                            self.floor_var.set(sp.level)
+                        xlim = self.ax.get_xlim(); ylim = self.ax.get_ylim()
+                        w = abs(xlim[1]-xlim[0]) * 0.5 or 5.0
+                        h = abs(ylim[1]-ylim[0]) * 0.5 or 5.0
+                        self.ax.set_xlim(cx-w/2, cx+w/2)
+                        self.ax.set_ylim(cy-h/2, cy+h/2)
+                        self._view_locked = True
+                self._view_selected_type = "space"
+                self._view_selected_id = fid
+            self._view_selected_override_xy = None
+            self._view_selected_override_poly = None
+            self.refresh_view()
+        tree.bind("<Double-1>", lambda _e: _go())
+
+        # ---- Delete one or many selected feature rows --------------------
+        def _delete_one_node(nid: str) -> int:
+            """Remove a Node + cascade-delete edges referring to it.
+            Returns the number of edges cascade-deleted."""
+            cascaded = 0
+            if nid not in self.model.nodes:
+                return 0
+            node = self.model.nodes.pop(nid, None)
+            self._new_node_ids.discard(nid)
+            # Cascade related edges
+            edges_to_del = [eid for eid, e in self.model.edges.items()
+                            if nid in e.connects]
+            if edges_to_del and self.model.source_tree is not None:
+                root_ = self.model.source_tree.getroot()
+                parent_of: Dict[ET.Element, ET.Element] = {}
+                for parent in root_.iter():
+                    for child in parent:
+                        parent_of[child] = parent
+                for eid in edges_to_del:
+                    edge = self.model.edges.pop(eid, None)
+                    self._new_edge_ids.discard(eid)
+                    cascaded += 1
+                    if edge is not None and edge.source_element is not None:
+                        ep = parent_of.get(edge.source_element)
+                        if ep is not None:
+                            epp = parent_of.get(ep)
+                            if (epp is not None
+                                    and local_name(ep.tag) == "edgeMember"):
+                                try: epp.remove(ep)
+                                except ValueError: pass
+                            else:
+                                try: ep.remove(edge.source_element)
+                                except ValueError: pass
+            # Remove the node element from XML
+            if (node is not None
+                    and node.source_element is not None
+                    and self.model.source_tree is not None):
+                root_ = self.model.source_tree.getroot()
+                parent_of: Dict[ET.Element, ET.Element] = {}
+                for parent in root_.iter():
+                    for child in parent:
+                        parent_of[child] = parent
+                target = node.source_element
+                p = parent_of.get(target)
+                if p is not None:
+                    gp = parent_of.get(p)
+                    if (gp is not None
+                            and local_name(p.tag) == "nodeMember"):
+                        try: gp.remove(p)
+                        except ValueError: pass
+                    else:
+                        try: p.remove(target)
+                        except ValueError: pass
+            # Also drop the auto-generated VS dual cell, if any
+            vs_id = f"VS_{nid}"
+            if vs_id in self.model.spaces:
+                self.model.spaces.pop(vs_id, None)
+                self._new_space_ids.discard(vs_id)
+            return cascaded
+
+        def _delete_one_space(sid: str) -> bool:
+            if sid not in self.model.spaces:
+                return False
+            sp = self.model.spaces.pop(sid, None)
+            self._new_space_ids.discard(sid)
+            if (sp is not None
+                    and sp.source_element is not None
+                    and self.model.source_tree is not None):
+                root_ = self.model.source_tree.getroot()
+                parent_of: Dict[ET.Element, ET.Element] = {}
+                for parent in root_.iter():
+                    for child in parent:
+                        parent_of[child] = parent
+                target = sp.source_element
+                p = parent_of.get(target)
+                if p is not None:
+                    gp = parent_of.get(p)
+                    if (gp is not None
+                            and local_name(p.tag) == "cellSpaceMember"):
+                        try: gp.remove(p)
+                        except ValueError: pass
+                    else:
+                        try: p.remove(target)
+                        except ValueError: pass
+            return True
+
+        def _delete_picked():
+            """Delete every selected feature row. Header rows (no model
+            target) are silently skipped. Multi-select supported."""
+            sels = list(tree.selection())
+            picks: List[Tuple[str, str]] = [
+                row_to_target[s] for s in sels if s in row_to_target
+            ]
+            # De-duplicate (a feature may appear under multiple sub-rows
+            # — e.g. a node listed inside a "Multi-cell→1 node" group).
+            seen: Set[Tuple[str, str]] = set()
+            uniq: List[Tuple[str, str]] = []
+            for kf in picks:
+                if kf not in seen:
+                    seen.add(kf); uniq.append(kf)
+            if not uniq:
+                messagebox.showinfo(
+                    "Delete",
+                    "Pick one or more conflict feature rows first "
+                    "(group header rows are not deletable).",
+                    parent=dlg)
+                return
+
+            if len(uniq) == 1:
+                kind, fid = uniq[0]
+                msg = (f"Remove {kind} '{fid}'?\n\n"
+                       + ("(Cascade: also removes edges referring to it"
+                          " and the auto-generated VS cell, if any.)\n"
+                          if kind == "node" else "")
+                       + "Save the file afterwards to persist.")
+            else:
+                preview = "\n".join(
+                    f"  • {k} '{f}'" for k, f in uniq[:10])
+                more = "" if len(uniq) <= 10 else f"\n  … +{len(uniq)-10} more"
+                msg = (f"Remove {len(uniq)} selected items?\n\n"
+                       f"{preview}{more}\n\n"
+                       "Save the file afterwards to persist.")
+            if not messagebox.askyesno("Delete", msg, parent=dlg):
+                return
+
+            removed = 0
+            cascaded_total = 0
+            for kind, fid in uniq:
+                if kind == "node":
+                    casc = _delete_one_node(fid)
+                    if casc >= 0 and fid not in self.model.nodes:
+                        removed += 1
+                        cascaded_total += casc
+                elif kind == "space":
+                    if _delete_one_space(fid):
+                        removed += 1
+
+            if cascaded_total:
+                messagebox.showinfo(
+                    "Delete",
+                    f"Removed {removed} item(s). "
+                    f"{cascaded_total} dangling edge(s) cascade-deleted.\n"
+                    "Save the file to persist.", parent=dlg)
+            _scan_and_populate()
+            self.refresh_view()
+
+        ttk.Button(footer, text="Delete",
+                   command=_delete_picked).pack(side="right", padx=(0, 6))
+        ttk.Button(footer, text="Refresh",
+                   command=_scan_and_populate).pack(side="right", padx=(0, 6))
+        ttk.Button(footer, text="Locate selected",
+                   command=_go).pack(side="right", padx=(0, 6))
+        ttk.Button(footer, text="Close",
+                   command=dlg.destroy).pack(side="right")
+        # Delete-key shortcut
+        tree.bind("<Delete>",    lambda _e: _delete_picked())
+        tree.bind("<BackSpace>", lambda _e: _delete_picked())
+        dlg.bind("<Delete>",     lambda _e: _delete_picked())
+        dlg.bind("<BackSpace>",  lambda _e: _delete_picked())
+
     def find_isolated_nodes_and_spaces(self) -> None:
         """Show a dialog listing isolated Nodes and CellSpaces.
 
@@ -6735,12 +9975,39 @@ class IndoorGMLViewerApp:
             messagebox.showwarning("No file", "Open a file first.")
             return
 
-        # Build edge-incidence index over node IDs
+        # Build edge-incidence index over node IDs.
+        # Robustness: edge.connects can sometimes carry a non-normalized
+        # space-id reference (the parser left a CellSpace href because no
+        # node had `duality` pointing at it). Treat the duality space-id
+        # of a node as a proxy for the node id when scanning, so a node
+        # whose dual space is referenced by an edge is NOT flagged
+        # isolated. We also accept edges whose endpoint coords match a
+        # node's coords (geometric incidence).
         nodes_with_edges: Set[str] = set()
+        # Map: space id → node id (via duality)
+        space_to_node: Dict[str, str] = {
+            n.duality: nid for nid, n in self.model.nodes.items()
+            if n.duality
+        }
+        XY_EPS_ISO = 0.5
+        Z_EPS_ISO  = 50.0
         for e in self.model.edges.values():
             for c in e.connects:
                 if c in self.model.nodes:
                     nodes_with_edges.add(c)
+                elif c in space_to_node:
+                    nodes_with_edges.add(space_to_node[c])
+            # Geometric incidence as a final safety net
+            if e.coords and len(e.coords) >= 2:
+                for ep in (e.coords[0], e.coords[-1]):
+                    for nid, n in self.model.nodes.items():
+                        if n.coord is None:
+                            continue
+                        if (abs(ep[0] - n.coord[0]) < XY_EPS_ISO
+                                and abs(ep[1] - n.coord[1]) < XY_EPS_ISO
+                                and abs(ep[2] - n.coord[2]) < Z_EPS_ISO):
+                            nodes_with_edges.add(nid)
+                            break
 
         isolated_nodes: List[Tuple[str, str]] = []  # (node_id, level)
         for nid, n in self.model.nodes.items():
@@ -6749,12 +10016,22 @@ class IndoorGMLViewerApp:
         isolated_nodes.sort(key=lambda x: (x[1], x[0]))
 
         # Build duality-target index over space IDs
+        # Virtual-cell detection robust to parse round-trip: the
+        # in-memory `is_virtual` flag is dropped on reload, so we also
+        # treat any cell with id "VS_…" and no geometry as virtual.
+        def _is_virtual(sp) -> bool:
+            if getattr(sp, "is_virtual", False):
+                return True
+            if sp.feature_id.startswith("VS_") and not sp.polygons_3d:
+                return True
+            return False
+
         spaces_with_dual: Set[str] = {
             n.duality for n in self.model.nodes.values() if n.duality
         }
         isolated_spaces: List[Tuple[str, str, str]] = []  # (space_id, level, name)
         for sid, sp in self.model.spaces.items():
-            if sp.is_virtual:
+            if _is_virtual(sp):
                 continue
             if sid not in spaces_with_dual:
                 isolated_spaces.append((sid, sp.level or "?", sp.name or ""))
@@ -6790,7 +10067,7 @@ class IndoorGMLViewerApp:
         nb.add(n_frame, text=f"Isolated Nodes ({len(isolated_nodes)})")
         n_tree = ttk.Treeview(
             n_frame, columns=("level", "id"), show="headings",
-            selectmode="browse", height=18)
+            selectmode="extended", height=18)
         n_tree.heading("level", text="Floor")
         n_tree.heading("id",    text="Node ID")
         n_tree.column("level", width=80, anchor="w")
@@ -6807,7 +10084,7 @@ class IndoorGMLViewerApp:
         nb.add(s_frame, text=f"Isolated CellSpaces ({len(isolated_spaces)})")
         s_tree = ttk.Treeview(
             s_frame, columns=("level", "id", "name"), show="headings",
-            selectmode="browse", height=18)
+            selectmode="extended", height=18)
         s_tree.heading("level", text="Floor")
         s_tree.heading("id",    text="CellSpace ID")
         s_tree.heading("name",  text="Name")
@@ -6885,20 +10162,43 @@ class IndoorGMLViewerApp:
             if self.model is None:
                 return
             n_with_e: Set[str] = set()
+            # Same conservative incidence check as the initial scan.
+            s2n: Dict[str, str] = {
+                nn.duality: nid_ for nid_, nn in self.model.nodes.items()
+                if nn.duality
+            }
             for ed in self.model.edges.values():
                 for cc in ed.connects:
                     if cc in self.model.nodes:
                         n_with_e.add(cc)
+                    elif cc in s2n:
+                        n_with_e.add(s2n[cc])
+                if ed.coords and len(ed.coords) >= 2:
+                    for ep in (ed.coords[0], ed.coords[-1]):
+                        for nid_, nn in self.model.nodes.items():
+                            if nn.coord is None:
+                                continue
+                            if (abs(ep[0] - nn.coord[0]) < 0.5
+                                    and abs(ep[1] - nn.coord[1]) < 0.5
+                                    and abs(ep[2] - nn.coord[2]) < 50.0):
+                                n_with_e.add(nid_)
+                                break
             new_iso_n = sorted(
                 ((nid, n.level or "?") for nid, n in self.model.nodes.items()
                  if nid not in n_with_e),
                 key=lambda x: (x[1], x[0]))
             sp_with_d: Set[str] = {
                 n.duality for n in self.model.nodes.values() if n.duality}
+            def _is_virt(sp) -> bool:
+                if getattr(sp, "is_virtual", False):
+                    return True
+                if sp.feature_id.startswith("VS_") and not sp.polygons_3d:
+                    return True
+                return False
             new_iso_s = sorted(
                 ((sid, sp.level or "?", sp.name or "")
                  for sid, sp in self.model.spaces.items()
-                 if not sp.is_virtual and sid not in sp_with_d),
+                 if not _is_virt(sp) and sid not in sp_with_d),
                 key=lambda x: (x[1], x[0]))
 
             n_tree.delete(*n_tree.get_children())
@@ -6914,10 +10214,118 @@ class IndoorGMLViewerApp:
                 f"{len(new_iso_s)} isolated cell spaces. "
                 "Double-click a row to locate it.")
 
+        def _delete_one_node(nid):
+            if nid not in self.model.nodes:
+                return False
+            node = self.model.nodes.pop(nid, None)
+            self._new_node_ids.discard(nid)
+            if (node is not None
+                    and node.source_element is not None
+                    and self.model.source_tree is not None):
+                root_ = self.model.source_tree.getroot()
+                parent_of: Dict[ET.Element, ET.Element] = {}
+                for parent in root_.iter():
+                    for child in parent:
+                        parent_of[child] = parent
+                target = node.source_element
+                p = parent_of.get(target)
+                if p is not None:
+                    gp = parent_of.get(p)
+                    if (gp is not None
+                            and local_name(p.tag) == "nodeMember"):
+                        try: gp.remove(p)
+                        except ValueError: pass
+                    else:
+                        try: p.remove(target)
+                        except ValueError: pass
+            vs_id = f"VS_{nid}"
+            if vs_id in self.model.spaces:
+                self.model.spaces.pop(vs_id, None)
+                self._new_space_ids.discard(vs_id)
+            return True
+
+        def _delete_one_space(sid):
+            if sid not in self.model.spaces:
+                return False
+            sp = self.model.spaces.pop(sid, None)
+            self._new_space_ids.discard(sid)
+            if (sp is not None
+                    and sp.source_element is not None
+                    and self.model.source_tree is not None):
+                root_ = self.model.source_tree.getroot()
+                parent_of: Dict[ET.Element, ET.Element] = {}
+                for parent in root_.iter():
+                    for child in parent:
+                        parent_of[child] = parent
+                target = sp.source_element
+                p = parent_of.get(target)
+                if p is not None:
+                    gp = parent_of.get(p)
+                    if (gp is not None
+                            and local_name(p.tag) == "cellSpaceMember"):
+                        try: gp.remove(p)
+                        except ValueError: pass
+                    else:
+                        try: p.remove(target)
+                        except ValueError: pass
+            return True
+
+        def _delete_selected():
+            """Delete every selected row in the currently visible tab.
+            Multi-select via Ctrl/Shift click is supported.
+            """
+            if self.model is None:
+                return
+            try:
+                tab_idx = nb.index(nb.select())
+            except Exception:
+                tab_idx = 0
+            tree = n_tree if tab_idx == 0 else s_tree
+            sels = list(tree.selection())
+            if not sels:
+                messagebox.showinfo(
+                    "Delete", "Pick one or more rows first.", parent=dlg)
+                return
+            ids = [tree.item(s, "values")[1] for s in sels]
+            kind = "node" if tab_idx == 0 else "CellSpace"
+            if len(ids) == 1:
+                msg = (f"Remove isolated {kind} '{ids[0]}'?\n"
+                       "Save the file afterwards to persist.")
+            else:
+                preview = "\n".join(f"  • {x}" for x in ids[:10])
+                more = "" if len(ids) <= 10 else f"\n  … +{len(ids)-10} more"
+                msg = (f"Remove {len(ids)} isolated {kind}(s)?\n\n"
+                       f"{preview}{more}\n\n"
+                       "Save the file afterwards to persist.")
+            if not messagebox.askyesno("Delete", msg, parent=dlg):
+                return
+
+            removed = 0
+            for fid in ids:
+                if tab_idx == 0:
+                    if _delete_one_node(fid):
+                        removed += 1
+                else:
+                    if _delete_one_space(fid):
+                        removed += 1
+
+            _rescan()
+            self.refresh_view()
+
+        ttk.Button(footer, text="Delete",
+                   command=_delete_selected).pack(side="right", padx=(0, 6))
         ttk.Button(footer, text="Refresh",
                    command=_rescan).pack(side="right", padx=(0, 6))
         ttk.Button(footer, text="Close",
                    command=dlg.destroy).pack(side="right")
+        # Delete key shortcut — works whether focus is on either tab tree
+        # or on the dialog itself.
+        n_tree.bind("<Delete>",    lambda _e: _delete_selected())
+        n_tree.bind("<BackSpace>", lambda _e: _delete_selected())
+        s_tree.bind("<Delete>",    lambda _e: _delete_selected())
+        s_tree.bind("<BackSpace>", lambda _e: _delete_selected())
+        dlg.bind("<Delete>",       lambda _e: _delete_selected())
+        dlg.bind("<BackSpace>",    lambda _e: _delete_selected())
 
     def create_virtual_cellspaces_for_orphan_nodes(self) -> None:
         """IndoorGML 2.0 requires each Node to have a dual CellSpace.
@@ -7036,20 +10444,13 @@ class IndoorGMLViewerApp:
                 and not self._vertical_edge_mode):
             return
 
-        # Draw newly created nodes (not visible via floor filter)
-        for nid in self._new_node_ids:
-            node = self.model.nodes.get(nid)
-            if node and node.coord:
-                self.ax.scatter([node.coord[0]], [node.coord[1]],
-                                color="tomato", s=18, zorder=5)
-
-        # Draw newly created edges
-        for eid in self._new_edge_ids:
-            edge = self.model.edges.get(eid)
-            if edge and len(edge.coords) >= 2:
-                xs = [p[0] for p in edge.coords]
-                ys = [p[1] for p in edge.coords]
-                self.ax.plot(xs, ys, color="deepskyblue", linewidth=1.0, zorder=4)
+        # The previous version force-drew every node / edge created in the
+        # current session here so they wouldn't be lost behind the floor
+        # filter. That fallback is no longer needed: node.level is always
+        # assigned at parse / create time, draw_on_axes uses an explicit Z
+        # fallback when the level is missing, and `expand_floor_graph` pulls
+        # in dually-linked nodes. Drawing them again caused off-floor new
+        # objects to bleed into every floor view in edit modes.
 
         # Highlight first node selected for connection (star marker)
         if self._graph_connect_first:
@@ -7094,6 +10495,15 @@ class IndoorGMLViewerApp:
 
     def _draw_space_create_overlay(self) -> None:
         """Draw the in-progress polygon and confirmed vertices during space creation."""
+        # Rectangle mode: highlight the first corner dot if set.
+        if (self._rect_create_mode
+                and self._rect_create_pt1 is not None):
+            x1, y1 = self._rect_create_pt1
+            self.ax.scatter([x1], [y1], color="green", s=60, zorder=10,
+                            edgecolors="black", linewidths=1.0)
+            self.ax.annotate("pt1", (x1, y1), color="green", fontsize=8,
+                             xytext=(6, 6), textcoords="offset points")
+
         verts = self._space_create_verts
         if not verts:
             return
@@ -7126,6 +10536,51 @@ class IndoorGMLViewerApp:
                         s=80, edgecolors="black", linewidths=1.0, zorder=10)
         self.ax.annotate("pt1", (x1, y1), color="yellow", fontsize=8,
                          xytext=(6, 6), textcoords="offset points")
+
+    def _draw_reference_points_overlay(self) -> None:
+        """Draw the file-wide LL/UR reference anchors and any pending
+        anchor-capture clicks. These are visible on every floor so the
+        user can align floorplans consistently."""
+        # Saved (file-wide) markers: red for LL, green for UR
+        if self._reference_points is not None:
+            ll, ur = self._reference_points
+            self.ax.scatter([ll[0]], [ll[1]], color="red",
+                            s=160, marker="X", zorder=15,
+                            edgecolors="white", linewidths=1.2)
+            self.ax.annotate(f"LL ({ll[0]:g}, {ll[1]:g})",
+                             (ll[0], ll[1]), color="red", fontsize=8,
+                             xytext=(8, -10), textcoords="offset points")
+            self.ax.scatter([ur[0]], [ur[1]], color="lime",
+                            s=160, marker="X", zorder=15,
+                            edgecolors="white", linewidths=1.2)
+            self.ax.annotate(f"UR ({ur[0]:g}, {ur[1]:g})",
+                             (ur[0], ur[1]), color="lime", fontsize=8,
+                             xytext=(8, 8), textcoords="offset points")
+
+        # In-progress anchor capture: highlight already-clicked points
+        # at their canvas coords so the user gets feedback before the
+        # extent is solved.
+        if self._anchor_mode:
+            if self._anchor_canvas_pt1 is not None:
+                x, y = self._anchor_canvas_pt1
+                self.ax.scatter([x], [y], color="orange", s=140,
+                                marker="o", zorder=16,
+                                edgecolors="black", linewidths=1.2,
+                                facecolors="none")
+                self.ax.annotate("LL?", (x, y), color="orange",
+                                 fontsize=9,
+                                 xytext=(8, -10),
+                                 textcoords="offset points")
+            if self._anchor_canvas_pt2 is not None:
+                x, y = self._anchor_canvas_pt2
+                self.ax.scatter([x], [y], color="orange", s=140,
+                                marker="o", zorder=16,
+                                edgecolors="black", linewidths=1.2,
+                                facecolors="none")
+                self.ax.annotate("UR?", (x, y), color="orange",
+                                 fontsize=9,
+                                 xytext=(8, 8),
+                                 textcoords="offset points")
 
     def _draw_split_overlay(self) -> None:
         """Draw polygon vertices of the split-target cell; highlight selected vertex."""
@@ -7178,9 +10633,9 @@ class IndoorGMLViewerApp:
         level_var = tk.StringVar(value=floor)
         ttk.Entry(dlg, textvariable=level_var, width=24).grid(row=1, column=1, padx=8, pady=4)
 
-        ttk.Label(dlg, text="Thickness:").grid(row=2, column=0, padx=8, pady=4, sticky="e")
+        ttk.Label(dlg, text="Thickness (cm):").grid(row=2, column=0, padx=8, pady=4, sticky="e")
         thick_var = tk.DoubleVar(value=self._door_thickness_var.get())
-        ttk.Spinbox(dlg, from_=10.0, to=10000.0, increment=10.0,
+        ttk.Spinbox(dlg, from_=1.0, to=1000.0, increment=1.0,
                     textvariable=thick_var, width=10).grid(row=2, column=1, padx=8, pady=4, sticky="w")
 
         confirmed = [False]
@@ -7233,7 +10688,10 @@ class IndoorGMLViewerApp:
         sp = SpaceFeature(
             feature_id=sid,
             name=name,
-            cls="TransferSpace",
+            # Doors carry the IndoorGML 2.0 ConnectionSpace subclass
+            # (this gets emitted as the element's local name on save:
+            # `<core:ConnectionSpace ns1:id="door_new_…">`).
+            cls="ConnectionSpace",
             level=level,
             polygons_3d=[floor_pts, ceil_pts],
             centers=[center] if center else [],
@@ -7270,5 +10728,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# 수정 시각: 2026-04-24 edit-mode-shortcuts-N-E-C-D (Claude Code에 의해 직접 편집됨)
