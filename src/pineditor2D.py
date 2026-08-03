@@ -37,6 +37,118 @@ warnings.filterwarnings(
 )
 
 
+# ── Canvas font ────────────────────────────────────────────────────────────
+# Tk widgets inherit TkDefaultFont and render CJK fine, but the Matplotlib
+# canvas does not go through Tk: it defaults to DejaVu Sans, which carries no
+# Hangul (or CJK) glyphs at all. Cell names such as "전기실" therefore came
+# out as tofu boxes, and every draw emitted a "Glyph … missing from font(s)"
+# warning per character.
+#
+# Pick the first installed font that actually covers the scripts in use.
+# Candidates are ordered per-platform, then a shared fallback list catches
+# the open-source families that ship with many Linux distributions.
+_CJK_FONT_CANDIDATES = (
+    # Windows
+    "Malgun Gothic", "맑은 고딕", "Gulim", "Batang", "Microsoft YaHei",
+    # macOS
+    "Apple SD Gothic Neo", "AppleGothic", "PingFang SC", "Hiragino Sans",
+    # Linux / cross-platform open source
+    "Noto Sans CJK KR", "Noto Sans KR", "NanumGothic", "Nanum Gothic",
+    "Noto Sans CJK JP", "Noto Sans CJK SC", "Source Han Sans KR",
+    "UnDotum", "Baekmuk Gulim", "WenQuanYi Zen Hei",
+)
+
+
+def _font_covers(path: str, sample: str) -> bool:
+    """True when the font file at `path` has a glyph for every char in sample.
+
+    Checking the actual cmap beats trusting a family name: the name a font
+    registers under varies by platform and locale (a Korean Windows may list
+    Malgun Gothic as '맑은 고딕'), and a name match tells us nothing about
+    coverage anyway.
+    """
+    try:
+        from fontTools.ttLib import TTFont, TTCollection
+    except Exception:
+        return True          # cannot verify — assume the name match was right
+    try:
+        if path.lower().endswith(".ttc"):
+            faces = TTCollection(path, lazy=True).fonts
+        else:
+            faces = [TTFont(path, lazy=True, fontNumber=0)]
+        for face in faces:
+            cmap = face.getBestCmap()
+            if all(ord(ch) in cmap for ch in sample):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _configure_canvas_font() -> Optional[str]:
+    """Prepend an installed CJK-capable font to Matplotlib's sans-serif list.
+
+    Returns the chosen family name, or None when the system has none — in
+    that case Latin text still renders correctly and only CJK degrades, so
+    this is a warning rather than a fatal condition.
+    """
+    try:
+        from matplotlib import font_manager, rcParams
+    except Exception:
+        return None
+
+    # "한글" — if a face carries these it carries Hangul generally.
+    sample = "\uD55C\uAE00"
+
+    by_name: Dict[str, str] = {}
+    for f in font_manager.fontManager.ttflist:
+        by_name.setdefault(f.name, f.fname)
+
+    # 1) Preferred families, in platform order, verified against the cmap.
+    chosen = None
+    for name in _CJK_FONT_CANDIDATES:
+        path = by_name.get(name)
+        if path and _font_covers(path, sample):
+            chosen = name
+            break
+
+    # 2) Nothing from the list matched. Rather than give up — the list cannot
+    #    name every CJK font on every system, and a stale font cache can hide
+    #    a freshly installed one — scan whatever is registered for coverage.
+    if chosen is None:
+        for name, path in sorted(by_name.items()):
+            if _font_covers(path, sample):
+                chosen = name
+                break
+
+    if chosen is None:
+        return None
+
+    # Keep DejaVu Sans behind it: the CJK font supplies Hangul, DejaVu still
+    # covers any symbol the CJK family happens to lack.
+    existing = [f for f in rcParams.get("font.sans-serif", []) if f != chosen]
+    rcParams["font.sans-serif"] = [chosen] + existing
+    rcParams["font.family"] = "sans-serif"
+    # A CJK face usually has no real italic; Matplotlib would fall back to a
+    # Latin-only font for minus signs otherwise.
+    rcParams["axes.unicode_minus"] = False
+    return chosen
+
+
+CANVAS_FONT = _configure_canvas_font()
+
+# Matplotlib emits one "Glyph NNNNN (...) missing from font(s)" warning per
+# *character* per draw. On a floor with a few hundred Korean labels that is
+# thousands of lines per redraw, which buries anything else the console has
+# to say. The condition is already reported once, in the status bar, so
+# silence the flood.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Glyph \d+ .* missing from font.*",
+    category=UserWarning,
+)
+
+
 # =========================================================
 # Data classes
 # =========================================================
@@ -82,6 +194,7 @@ class EdgeFeature:
     source_element: Optional[ET.Element] = None
     layer_id: str = ""           # owning ThematicLayer id
     weight: float = 1.0          # core:weight — default 1.0 for new edges
+    duality: str = ""            # CellBoundary id this edge is dual to
 
 
 @dataclass
@@ -144,6 +257,11 @@ class IndoorModel:
     inter_layer_connections: Dict[str, InterLayerConnection] = field(default_factory=dict)
     source_tree: Optional[ET.ElementTree] = None
     source_path: str = ""
+    # Non-fatal problems detected while parsing the source file, e.g. two
+    # <Edge> elements sharing one id (only the last survives in `edges`).
+    # `open_file` surfaces these so a silent data loss never goes unnoticed.
+    # Each entry: (kind, feature_id, copies_found).
+    load_conflicts: List[Tuple[str, str, int]] = field(default_factory=list)
     # Cache: floor (level string) → set of space ids. Built lazily on first
     # query; auto-invalidated by `_SpaceDict` mutations. If a SpaceFeature's
     # `level` is mutated in place (rare), call `invalidate_floor_index()`.
@@ -460,6 +578,9 @@ def parse_indoorgml(xml_path: str) -> IndoorModel:
             # consistent across save → reload round-trips.
             is_virtual_flag = (fid.startswith("VS_") and not polygons)
 
+            if fid in model.spaces:
+                model.load_conflicts.append((ln, fid, 2))
+
             model.spaces[fid] = SpaceFeature(
                 feature_id=fid,
                 name=name,
@@ -507,6 +628,9 @@ def parse_indoorgml(xml_path: str) -> IndoorModel:
                             else:
                                 connects.append(rid)
 
+            if nid in model.nodes:
+                model.load_conflicts.append(("Node", nid, 2))
+
             model.nodes[nid] = NodeFeature(
                 node_id=nid,
                 coord=coord,
@@ -531,13 +655,29 @@ def parse_indoorgml(xml_path: str) -> IndoorModel:
                 if len(pts) >= 2:
                     coords = pts
 
+            # Only <connects> feeds the endpoint list. Scooping up *every*
+            # descendant href (as an earlier version did) also swallowed the
+            # sibling <duality> reference, so an edge carrying a duality came
+            # out with three "endpoints" — the third one dangling, because an
+            # Edge's duality points at a CellBoundary, not a Node. That bogus
+            # third entry then reached the XML writer and the renderer.
+            # An Edge has exactly two endpoints; keep both even when they are
+            # equal, so a self-loop in the source stays visible to Check
+            # rather than being silently collapsed by de-duplication.
             connects: List[str] = []
+            duality: str = ""
             for sub in elem.iter():
+                sub_ln = local_name(sub.tag)
+                if sub_ln not in ("connects", "duality"):
+                    continue
                 for k, v in sub.attrib.items():
                     if k.endswith("href"):
                         rid = href_to_id(v)
                         if rid:
-                            connects.append(rid)
+                            if sub_ln == "duality":
+                                duality = rid
+                            else:
+                                connects.append(rid)
 
             # Parse <core:weight> child if present; default 1.0 otherwise
             weight_val = 1.0
@@ -549,19 +689,31 @@ def parse_indoorgml(xml_path: str) -> IndoorModel:
                         pass
                     break
 
+            if eid in model.edges:
+                model.load_conflicts.append(("Edge", eid, 2))
+
             model.edges[eid] = EdgeFeature(
                 edge_id=eid,
                 coords=coords,
-                connects=list(dict.fromkeys(connects)),
+                connects=connects,
                 source_element=elem,
                 layer_id=_layer_of(elem),
                 weight=weight_val,
+                duality=duality,
             )
 
     fill_missing_node_coords_from_spaces(model)
     fill_missing_node_coords_from_edges(model)
     fill_node_levels_from_edges_and_spaces(model)
+    space_refs = sum(1 for e in model.edges.values()
+                     for r in e.connects if r in model.spaces)
     normalize_edge_connects_to_node_ids(model)
+    if space_refs:
+        # Not a duplicate-id conflict, but the same class of problem: the
+        # file on disk says something the model does not. Recorded so the
+        # UI can tell the user the file violates the Edge→Node constraint
+        # (the XSD will not, since xlink:href is just an anyURI).
+        model.load_conflicts.append(("connects→CellSpace", "", space_refs))
     rebuild_all_edge_coords_from_nodes(model)
 
     # Cross-link: set space.duality from node.duality (reverse direction)
@@ -597,6 +749,35 @@ def parse_indoorgml(xml_path: str) -> IndoorModel:
     return model
 
 
+def resolve_connect_ref_to_node_id(model: IndoorModel, ref: str) -> str:
+    """Map one `connects` reference onto a Node id, if that is possible.
+
+    An IndoorGML Edge connects Nodes. Converters routinely write the dual
+    CellSpace id instead ('cell_X' where the node is 'S_cell_X'), and the
+    XSD cannot catch it: `xlink:href` is declared `xsd:anyURI`, so a
+    validator only checks that the string looks like a URI, never what kind
+    of element it points at. Such a file validates cleanly and still breaks
+    every router that dereferences the endpoint.
+
+    Resolution order:
+      1. already a Node — return unchanged;
+      2. a CellSpace whose `duality` names a Node — return that Node;
+      3. anything else — return unchanged, so the caller can preserve it
+         verbatim and let Check → Find Broken Edge Connections report it.
+
+    Step 2 is deliberately keyed off the *duality link* rather than an
+    'S_' + id naming convention: this file contains cells whose dual node
+    does not follow that pattern (VS_S_2d0c0 → S_2d0c0), and guessing from
+    the id would silently mis-wire them.
+    """
+    if ref in model.nodes:
+        return ref
+    space = model.spaces.get(ref)
+    if space is not None and space.duality and space.duality in model.nodes:
+        return space.duality
+    return ref
+
+
 def normalize_edge_connects_to_node_ids(model: IndoorModel) -> None:
     """Replace space-ID references in edge.connects with the corresponding node IDs.
 
@@ -615,7 +796,70 @@ def normalize_edge_connects_to_node_ids(model: IndoorModel) -> None:
                 if ref in model.spaces:
                     space_to_node[ref] = node.node_id
     for edge in model.edges.values():
-        edge.connects = [space_to_node.get(ref, ref) for ref in edge.connects]
+        edge.connects = [
+            space_to_node.get(ref) or resolve_connect_ref_to_node_id(model, ref)
+            for ref in edge.connects
+        ]
+
+
+def _sync_edge_connects_in_xml(model: IndoorModel) -> None:
+    """Write `edge.connects` back to each Edge's `<connects>` elements.
+
+    Two problems are fixed here, both of which used to survive a round trip
+    because the writer only touched geometry and never revisited an existing
+    Edge's references.
+
+    *Endpoint edits were lost.* Re-pointing an edge in the editor changed
+    `edge.connects` in memory only; the file kept the old endpoints.
+
+    *Mixed reference conventions.* An IndoorGML Edge connects Nodes, but
+    converters commonly emit the dual CellSpace id instead ('cell_X' where
+    the node is 'S_cell_X'). `parse_indoorgml` resolves those on load via
+    `normalize_edge_connects_to_node_ids`, so the editor works either way —
+    but the file stayed inconsistent, and edges created in the editor were
+    written with node ids, leaving one file with both conventions (in the
+    hospital test model: 16523 cell-style vs 6629 node-style references,
+    with 2081 edges mixing the two within a single element). Normalising on
+    save makes every endpoint a Node reference.
+
+    A reference that resolves to nothing is left exactly as-is rather than
+    dropped, so Check → Find Broken Edge Connections can still report it.
+    """
+    for edge in model.edges.values():
+        elem = edge.source_element
+        if elem is None:
+            continue
+
+        pos_elems = [c for c in elem if local_name(c.tag) == "connects"]
+        if not pos_elems:
+            continue
+
+        # Resolve each endpoint independently. An earlier version bailed out
+        # unless *every* endpoint resolved, which meant one broken reference
+        # kept its whole edge on the old cell-style convention.
+        refs = [resolve_connect_ref_to_node_id(model, r) for r in edge.connects]
+
+        for ce, ref in zip(pos_elems, refs):
+            for k in list(ce.attrib):
+                if k.endswith("href"):
+                    ce.attrib[k] = f"#{ref}"
+                    break
+            else:
+                ce.attrib[f"{XLINK}href"] = f"#{ref}"
+
+        # An edge whose endpoint count changed in the editor needs the
+        # element list resized, not just rewritten.
+        if len(refs) > len(pos_elems):
+            template = pos_elems[-1]
+            idx = list(elem).index(template)
+            for extra in refs[len(pos_elems):]:
+                ce = ET.Element(template.tag)
+                ce.attrib[f"{XLINK}href"] = f"#{extra}"
+                idx += 1
+                elem.insert(idx, ce)
+        elif len(refs) < len(pos_elems):
+            for ce in pos_elems[len(refs):]:
+                elem.remove(ce)
 
 
 def rebuild_all_edge_coords_from_nodes(model: IndoorModel) -> None:
@@ -624,7 +868,11 @@ def rebuild_all_edge_coords_from_nodes(model: IndoorModel) -> None:
     for edge in model.edges.values():
         pts = [model.nodes[ref].coord for ref in edge.connects
                if ref in model.nodes and model.nodes[ref].coord is not None]
-        if len(pts) >= 2:
+        # A malformed source may point both <connects> at the same cell.
+        # Rebuilding from those endpoints would collapse the edge to a
+        # zero-length segment and it would vanish from the canvas, so keep
+        # whatever geometry the file actually carried and let Check report it.
+        if len(pts) >= 2 and pts[0] != pts[-1]:
             edge.coords = [pts[0], pts[-1]]
 
 
@@ -735,7 +983,17 @@ def _update_ring_coords(elem: ET.Element, poly: List[Tuple[float, float, float]]
     trailing vertices when a polygon shrank (causing self-intersecting
     “zombie” geometry on reload) and silently dropping new vertices when a
     polygon grew.
+
+    A `gml:LinearRing` must repeat its first position at the end. Callers
+    hold rings in both conventions — cells parsed from XML keep the closing
+    duplicate, cells built in the editor drop it — and this function is the
+    single point every geometry edit passes through on its way to the XML,
+    so the ring is closed here rather than at each call site. Files whose
+    rings were already left open are therefore repaired on the next save.
     """
+    if len(poly) >= 3 and poly[0][:2] != poly[-1][:2]:
+        poly = list(poly) + [poly[0]]
+
     for ring in elem.iter():
         if local_name(ring.tag) not in ("LinearRing", "Ring"):
             continue
@@ -1513,9 +1771,16 @@ def _add_new_edges_to_xml(model: IndoorModel, new_edge_ids: Set[str]) -> None:
         weight_elem = ET.SubElement(e_elem, f"{CORE}weight")
         weight_elem.text = f"{getattr(edge, 'weight', 1.0)}"
 
+        # Never emit a CellSpace id here. `edge.connects` normally holds node
+        # ids, but normalize_edge_connects_to_node_ids() passes through
+        # anything it could not resolve, and that value used to be written
+        # verbatim — which is how an editor session could *introduce* the
+        # very cell-style reference this file already suffers from. Resolve
+        # once more at the point of writing; genuinely unresolvable ids are
+        # still written as-is so Check can report them.
         for conn_id in edge.connects:
             ce = ET.SubElement(e_elem, f"{CORE}connects")
-            ce.attrib[f"{XLINK}href"] = f"#{conn_id}"
+            ce.attrib[f"{XLINK}href"] = f"#{resolve_connect_ref_to_node_id(model, conn_id)}"
 
         duality = ET.SubElement(e_elem, f"{CORE}duality")
         duality.text = ""
@@ -1574,6 +1839,8 @@ def save_indoorgml(model: IndoorModel, path: str,
     for node in model.nodes.values():
         if node.source_element is not None and node.coord is not None:
             _update_node_coord_in_xml(node.source_element, node.coord)
+
+    _sync_edge_connects_in_xml(model)
 
     # Remove deleted spaces from XML
     psl = _find_primal_space_layer(root)
@@ -1657,8 +1924,33 @@ def save_indoorgml(model: IndoorModel, path: str,
 # =========================================================
 # Floor graph utilities
 # =========================================================
+_FLOOR_LABEL_RE = re.compile(r"^\s*(?P<b>[Bb])?\s*(?P<num>\d+)\s*[Ff]?\s*$")
+
+
+def floor_sort_key(name: Optional[str]) -> Tuple[int, float, str]:
+    """Natural ordering key for floor labels.
+
+    Plain ``sorted()`` puts '10F' before '1F' and drops every basement at the
+    end, which is unusable for a tower with 17 levels.  This key yields the
+    order a building occupant expects::
+
+        B4F < B3F < B2F < B1F < 1F < 2F < ... < 9F < 10F < ... < 13F
+
+    Basements sort by negated number so a deeper basement comes first.
+    Labels that do not look like a floor at all (''Mezzanine'', 'Roof', …)
+    keep a stable alphabetical order *after* every recognised floor rather
+    than being interleaved arbitrarily.
+    """
+    s = (name or "").strip()
+    m = _FLOOR_LABEL_RE.match(s)
+    if m:
+        num = int(m.group("num"))
+        return (0, -num if m.group("b") else num, s)
+    return (1, 0.0, s.lower())
+
+
 def get_available_floors(model: IndoorModel) -> List[str]:
-    return sorted(model.floor_index().keys())
+    return sorted(model.floor_index().keys(), key=floor_sort_key)
 
 
 def get_space_ids_on_floor(model: IndoorModel, floor: str) -> Set[str]:
@@ -2175,7 +2467,11 @@ def draw_on_axes(ax, model: IndoorModel, floor: Optional[str] = None, show_label
 class IndoorGMLViewerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f"IndoorGML Viewer  v{VERSION}")
+        # Showing the resolved canvas font makes a CJK problem self-evident:
+        # if labels are boxes, the title says which font was picked (or that
+        # none was), instead of the user having to guess.
+        _font_note = f"  [font: {CANVAS_FONT}]" if CANVAS_FONT else "  [font: none — CJK may not render]"
+        self.root.title(f"IndoorGML Viewer  v{VERSION}{_font_note}")
         self.root.geometry("1200x800")
 
         self.model: Optional[IndoorModel] = None
@@ -2354,6 +2650,13 @@ class IndoorGMLViewerApp:
         self._build_ui()
         self._connect_matplotlib_events()
 
+        if CANVAS_FONT is None:
+            # Not fatal — Latin labels are unaffected — but silently drawing
+            # every Korean cell name as boxes is worse than saying so.
+            self.status_var.set(
+                "No CJK font found; non-Latin labels may show as boxes. "
+                "Install e.g. Noto Sans KR or Nanum Gothic, then restart.")
+
     def _build_ui(self) -> None:
         # ── Menubar ──────────────────────────────────────────────────────────
         _mf = ("TkDefaultFont", 10, "bold")  # menu font — match toolbox font size
@@ -2363,9 +2666,20 @@ class IndoorGMLViewerApp:
         # so we build our own bar from Menubutton widgets instead.
         # IMPORTANT: each tk.Menu must be a child of its own Menubutton so that
         # the dropdown opens correctly.
-        _mb_bg  = "SystemButtonFace"
-        _mb_abg = "SystemHighlight"
-        _mb_afg = "SystemHighlightText"
+        # "SystemButtonFace" & friends are Windows-only Tk colour names; on
+        # X11 / Aqua they raise TclError("unknown color name") and the app
+        # dies before the first window appears. Probe once and fall back to
+        # neutral literals so the editor starts on Linux and macOS too.
+        def _sys_colour(name: str, fallback: str) -> str:
+            try:
+                self.root.winfo_rgb(name)
+                return name
+            except tk.TclError:
+                return fallback
+
+        _mb_bg  = _sys_colour("SystemButtonFace",      "#f0f0f0")
+        _mb_abg = _sys_colour("SystemHighlight",       "#0078d7")
+        _mb_afg = _sys_colour("SystemHighlightText",   "#ffffff")
         menubar_frame = tk.Frame(self.root, bg=_mb_bg, bd=0, relief="flat")
         menubar_frame.pack(side="top", fill="x")
 
@@ -2487,6 +2801,8 @@ class IndoorGMLViewerApp:
                                     command=self.find_nodes_without_duality)
         self._misc_menu.add_command(label="Find Cells without Node...",
                                     command=self.find_cells_without_node)
+        self._misc_menu.add_command(label="Find Broken Edge Connections...",
+                                    command=self.find_broken_edge_connections)
         self._misc_menu.add_command(label="Find Duality Conflicts...",
                                     command=self.find_duality_conflicts)
         self._misc_menu.add_command(label="Normalize Floor Z...",
@@ -2503,6 +2819,8 @@ class IndoorGMLViewerApp:
         self._misc_menu.add_separator()
         self._misc_menu.add_command(label="Repair: drop trailing duplicate vertices...",
                                     command=self.repair_trailing_duplicate_vertices)
+        self._misc_menu.add_command(label="Repair: remove self-loop edges...",
+                                    command=self.repair_self_loop_edges)
         self._misc_menu.add_command(label="Repair: drop self-intersecting tail...",
                                     command=self.repair_self_intersecting_tail)
 
@@ -2984,6 +3302,60 @@ class IndoorGMLViewerApp:
             self._reference_points = None
         self._view_locked = False
         self.refresh_view()
+        self._warn_about_load_conflicts()
+
+    def _warn_about_load_conflicts(self) -> None:
+        """Tell the user when the source file held two elements with one id.
+
+        Features live in id-keyed dicts, so a repeated id means only the last
+        copy survives the load — the earlier one is dropped without a trace.
+        Staying quiet about that is the worst option: the user edits and saves
+        a file that has quietly lost features. Point them at Check → Find
+        Duplicate IDs, which reads the XML tree directly and can clean up.
+        """
+        if self.model is None or not self.model.load_conflicts:
+            return
+
+        by_kind: Dict[str, List[str]] = {}
+        schema_note = ""
+        for kind, fid, copies in self.model.load_conflicts:
+            if kind == "connects→CellSpace":
+                schema_note = (
+                    f"\n\n{copies} edge endpoint(s) reference a CellSpace "
+                    f"instead of a Node. An IndoorGML Edge connects Nodes, "
+                    f"so this violates the model — but an XSD validator "
+                    f"cannot catch it, because xlink:href is only typed as "
+                    f"anyURI. They have been resolved to their dual Nodes "
+                    f"for editing, and saving will write the corrected "
+                    f"references back."
+                )
+                continue
+            by_kind.setdefault(kind, []).append(fid)
+
+        if not by_kind:
+            if schema_note:
+                messagebox.showwarning("Non-conforming references",
+                                       schema_note.strip())
+            return
+
+        lines = []
+        for kind in sorted(by_kind):
+            ids = by_kind[kind]
+            shown = ", ".join(ids[:5])
+            if len(ids) > 5:
+                shown += f", … (+{len(ids) - 5} more)"
+            lines.append(f"  • {kind}: {len(ids)} — {shown}")
+
+        total = sum(len(v) for v in by_kind.values())
+        messagebox.showwarning(
+            "Duplicate IDs in source file",
+            f"{total} element(s) share an id with an earlier element of the "
+            f"same kind. Only the last copy of each was loaded, so the file "
+            f"currently in the editor has fewer features than the file on "
+            f"disk:\n\n" + "\n".join(lines) +
+            "\n\nUse Check → Find Duplicate IDs... to inspect every copy and "
+            "clean them up before saving." + schema_note,
+        )
 
     def refresh_view(self) -> None:
         if self.model is None:
@@ -3155,7 +3527,7 @@ class IndoorGMLViewerApp:
         floors = set(get_available_floors(self.model))
         # Include any user-created empty floors (no cells yet)
         floors.update(self._floor_z_overrides.keys())
-        floor_list = sorted(floors)
+        floor_list = sorted(floors, key=floor_sort_key)
         active_values = ["All"] + floor_list if floor_list else ["All"]
         self.floor_combo["values"] = active_values
         if self.floor_var.get() not in active_values:
@@ -4613,7 +4985,17 @@ class IndoorGMLViewerApp:
                     self._snap_point = None
             else:
                 self._snap_point = None
+            # A ring parsed from GML repeats its first vertex at the end.
+            # Dragging one twin has to move the other, or the ring silently
+            # opens: the loop below propagates to *sibling* polygons but
+            # skips this one, so nothing else would catch it.
+            was_closed = len(poly) > 2 and poly[0][:2] == poly[-1][:2]
             poly[vi] = (new_x, new_y, old_z)
+            if was_closed:
+                if vi == 0:
+                    poly[-1] = (new_x, new_y, poly[-1][2])
+                elif vi == len(poly) - 1:
+                    poly[0] = (new_x, new_y, poly[0][2])
             # Propagate the same X,Y shift to all sibling polygons (ceiling, walls)
             for other_poly in sp.polygons_3d:
                 if other_poly is poly:
@@ -8031,6 +8413,114 @@ class IndoorGMLViewerApp:
             f"{head}{more}\n\nSave the file to make the fix permanent.")
         self.refresh_view()
 
+    def repair_self_loop_edges(self) -> None:
+        """Delete Edges whose two endpoints resolve to the same Node.
+
+        A self-loop expresses no transition: it cannot change reachability,
+        so it contributes nothing to routing, while still being walked by
+        every graph traversal (and tripping algorithms that assume an edge
+        has two distinct ends).
+
+        These are typically produced upstream, not in this editor — a
+        converter that maps each endpoint to `owner_cell(boundary)` without
+        checking whether both boundaries belong to the *same* cell. A big
+        room with two or more openings then yields an edge from that room's
+        dual node back to itself. The original intent ("cross this room from
+        opening A to opening B") needs a node per opening to be expressed
+        properly, and the boundary geometry that would allow rebuilding that
+        is generally not present in the file — so removal is the only repair
+        available here. Regenerate from the source data to keep the detail.
+        """
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
+
+        loops: List[Tuple[str, str, str]] = []   # (edge_id, floor, cell_id)
+        for eid, e in self.model.edges.items():
+            refs = e.connects
+            if len(refs) != 2 or refs[0] != refs[1]:
+                continue
+            node = self.model.nodes.get(refs[0])
+            cell = self.model.spaces.get(node.duality) if node else None
+            floor = ""
+            if node is not None and node.level:
+                floor = node.level
+            elif cell is not None and cell.level:
+                floor = cell.level
+            loops.append((eid, floor or "?",
+                          cell.feature_id if cell else (refs[0] or "?")))
+
+        if not loops:
+            messagebox.showinfo("Repair", "No self-loop edges found.")
+            return
+
+        # Preview grouped by the cell that carries the loops — far more
+        # readable than 1500 raw edge ids, and it makes the "a few big rooms
+        # cause all of this" shape obvious at a glance.
+        per_cell: Dict[Tuple[str, str], int] = {}
+        for _eid, floor, cell_id in loops:
+            per_cell[(floor, cell_id)] = per_cell.get((floor, cell_id), 0) + 1
+        ranked = sorted(per_cell.items(), key=lambda kv: (-kv[1], kv[0]))
+
+        lines = []
+        for (floor, cell_id), n in ranked[:20]:
+            sp = self.model.spaces.get(cell_id)
+            nm = f" ({sp.name})" if sp is not None and sp.name else ""
+            lines.append(f"  • {floor}  {cell_id}{nm} — {n} edge(s)")
+        more = ("" if len(ranked) <= 20
+                else f"\n  … and {len(ranked) - 20} more cell(s).")
+
+        if not messagebox.askyesno(
+                "Repair: remove self-loop edges",
+                f"{len(loops)} self-loop edge(s) on {len(per_cell)} cell(s) "
+                f"will be removed:\n\n" + "\n".join(lines) + more +
+                "\n\nRouting is unaffected — a self-loop cannot change "
+                "reachability.\n\nSave the file to make the fix permanent."):
+            return
+
+        # Build the child→parent map ONCE. `_delete_one` rebuilds it per
+        # feature, which is fine for a handful of rows but quadratic here:
+        # this file has ~600k elements and 1500 loops to drop.
+        parent_of: Dict[ET.Element, ET.Element] = {}
+        root = (self.model.source_tree.getroot()
+                if self.model.source_tree is not None else None)
+        if root is not None:
+            for parent in root.iter():
+                for child in parent:
+                    parent_of[child] = parent
+
+        removed = 0
+        for eid, _floor, _cell_id in loops:
+            edge = self.model.edges.pop(eid, None)
+            self._new_edge_ids.discard(eid)
+            removed += 1
+            if edge is None or edge.source_element is None or root is None:
+                continue
+            target = edge.source_element
+            p = parent_of.get(target)
+            if p is None:
+                continue
+            gp = parent_of.get(p)
+            if gp is not None and local_name(p.tag) == "edgeMember":
+                try: gp.remove(p)
+                except ValueError: pass
+            else:
+                try: p.remove(target)
+                except ValueError: pass
+
+        if self._graph_selected_edge in {l[0] for l in loops}:
+            self._graph_selected_edge = None
+        if (self._view_selected_type == "edge"
+                and self._view_selected_id in {l[0] for l in loops}):
+            self._view_selected_type = None
+            self._view_selected_id = None
+
+        messagebox.showinfo(
+            "Repair",
+            f"Removed {removed} self-loop edge(s).\n\n"
+            "Save the file to make the fix permanent.")
+        self.refresh_view()
+
     def repair_self_intersecting_tail(self) -> None:
         """Heuristic repair of self-intersecting polygons by truncating their
         tail until the polygon becomes simple (non-self-intersecting).
@@ -9092,7 +9582,8 @@ class IndoorGMLViewerApp:
         """Generic non-modal list dialog used by `find_nodes_without_duality`
         and `find_cells_without_node`. Each row tuple is
         (id, level, name_or_blank, signature).
-        `kind` is "node" or "space" — drives Locate / Delete behaviour.
+        `kind` is "node", "space" or "edge" — drives Locate / Delete
+        behaviour.
         `rescan_fn` returns a fresh list of rows.
         """
         existing = getattr(self, "_check_list_dlg", None)
@@ -9157,6 +9648,22 @@ class IndoorGMLViewerApp:
                 if n and n.coord:
                     cx, cy = n.coord[0], n.coord[1]
                 self._view_selected_type = "node"
+                self._view_selected_id   = fid
+            elif kind == "edge":
+                e = self.model.edges.get(fid)
+                if e and len(e.coords) >= 2:
+                    # Centre on the segment's midpoint so both endpoints
+                    # stay in frame.
+                    cx = (e.coords[0][0] + e.coords[-1][0]) / 2.0
+                    cy = (e.coords[0][1] + e.coords[-1][1]) / 2.0
+                elif e and e.connects:
+                    # Degenerate geometry — fall back to a live endpoint.
+                    for ref in e.connects:
+                        nd = self.model.nodes.get(ref)
+                        if nd and nd.coord:
+                            cx, cy = nd.coord[0], nd.coord[1]
+                            break
+                self._view_selected_type = "edge"
                 self._view_selected_id   = fid
             else:
                 sp = self.model.spaces.get(fid)
@@ -9233,6 +9740,28 @@ class IndoorGMLViewerApp:
                 if vs_id in self.model.spaces:
                     self.model.spaces.pop(vs_id, None)
                     self._new_space_ids.discard(vs_id)
+            elif kind == "edge":
+                edge = self.model.edges.pop(fid, None)
+                self._new_edge_ids.discard(fid)
+                if (edge is not None
+                        and edge.source_element is not None
+                        and self.model.source_tree is not None):
+                    root_ = self.model.source_tree.getroot()
+                    parent_of: Dict[ET.Element, ET.Element] = {}
+                    for parent in root_.iter():
+                        for child in parent:
+                            parent_of[child] = parent
+                    target = edge.source_element
+                    p = parent_of.get(target)
+                    if p is not None:
+                        gp = parent_of.get(p)
+                        if (gp is not None
+                                and local_name(p.tag) == "edgeMember"):
+                            try: gp.remove(p)
+                            except ValueError: pass
+                        else:
+                            try: p.remove(target)
+                            except ValueError: pass
             else:                                   # space
                 sp = self.model.spaces.pop(fid, None)
                 self._new_space_ids.discard(fid)
@@ -9320,6 +9849,83 @@ class IndoorGMLViewerApp:
             "Nodes without Duality",
             _scan(),
             kind="node",
+            rescan_fn=_scan,
+        )
+
+    def find_broken_edge_connections(self) -> None:
+        """List Edges whose endpoints do not describe a valid transition.
+
+        An IndoorGML Edge joins exactly two distinct Nodes. Four ways a
+        source file breaks that, each reported with its own note:
+
+        * ``endpoints: N``   — not exactly two ``<connects>``.
+        * ``dangling → 'X'`` — an endpoint naming a Node that is nowhere in
+          the file. Such an edge cannot be traversed and is invisible to
+          node-based cascade deletes.
+        * ``self-loop``      — both endpoints on the same Node, so the edge
+          expresses no transition at all. Usually a converter bug that wrote
+          one cell's href twice.
+        * ``duality → 'X'``  — the edge's dual CellBoundary is missing. The
+          edge still works for routing, so this is listed last and on its own.
+        """
+        if self.model is None:
+            messagebox.showwarning("No file", "Open a file first.")
+            return
+
+        def _node_floor(ref: str) -> str:
+            n = self.model.nodes.get(ref)
+            if n is None:
+                return ""
+            if n.level:
+                return n.level
+            sp = self.model.spaces.get(n.duality or "")
+            return (sp.level if sp and sp.level else "") or ""
+
+        def _scan():
+            rows: List[Tuple[str, str, str, str]] = []
+            known_ids = (set(self.model.spaces)
+                         | set(self.model.nodes)
+                         | set(self.model.edges))
+            for eid, e in self.model.edges.items():
+                refs = list(e.connects)
+                notes: List[str] = []
+
+                if len(refs) != 2:
+                    notes.append(f"endpoints: {len(refs)}")
+
+                missing = [r for r in refs if r not in self.model.nodes]
+                for r in dict.fromkeys(missing):
+                    notes.append(f"dangling → '{r}'")
+
+                if len(refs) == 2 and refs[0] == refs[1]:
+                    notes.append("self-loop")
+
+                dual = (e.duality or "").strip()
+                if dual and dual not in known_ids:
+                    notes.append(f"duality → '{dual}'")
+
+                if not notes:
+                    continue
+
+                floor = next((f for f in (_node_floor(r) for r in refs) if f), "?")
+                rows.append((eid, floor, " ↔ ".join(refs) or "—",
+                             "; ".join(notes)))
+
+            # Traversal-breaking problems first, duality-only rows last.
+            def _rank(row):
+                note = row[3]
+                if "dangling" in note or "endpoints" in note:
+                    return 0
+                if "self-loop" in note:
+                    return 1
+                return 2
+            rows.sort(key=lambda r: (_rank(r), r[1], r[0]))
+            return rows
+
+        self._open_check_list_dialog(
+            "Broken Edge Connections",
+            _scan(),
+            kind="edge",
             rescan_fn=_scan,
         )
 
@@ -10729,4 +11335,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-% last updated on May 14, 2026 by Ki-Joune Li with the support of Claude
+# last updated on May 14, 2026 by Ki-Joune Li with the support of Claude
