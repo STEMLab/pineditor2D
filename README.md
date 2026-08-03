@@ -392,10 +392,12 @@ Backspace key** as a shortcut for the Delete button.
 | **Find Nodes without Duality…**            | Nodes whose own `<duality>` href is empty or dangles to a missing CellSpace.                                                          |
 | **Find Cells without Node…**               | Cells whose own `<duality>` href is empty / dangling. Also surfaces *orphan virtual cells* (left over from a node that was later deleted) under a clear "orphan VS" tag. |
 | **Find Duality Conflicts…**                | Three categories: multi-cell → 1 node, multi-node → 1 cell, asymmetric (cell→N but N→other). Tree view with sub-rows per conflicting feature. Delete with cascade. |
+| **Find Broken Edge Connections…**          | Edges that do not describe a valid transition, each row tagged with why: `endpoints: N` (not exactly two `<connects>`), `dangling → 'X'` (endpoint names a Node that is not in the file), `self-loop` (both endpoints on one Node), `duality → 'X'` (the dual CellBoundary is missing). Traversal-breaking rows sort first; duality-only rows last, since those still route fine. Locate centres on the segment midpoint. |
 | **Find Duplicate IDs…**                    | Same XML id appearing on more than one Node / Edge / CellSpace / layer. Each copy is a row of its own with a per-copy signature (z value for nodes, vertex count for cells, …). **Locate selected** previews each copy at its own coords. **Rename ID…** gives one copy a fresh id and re-targets only the edges geometrically incident on that exact (x, y, z). **Delete this copy** removes the picked copy(s); when the deleted copy is the unique node at its z layer, edges physically tied to that z are cascade-deleted. |
 | **Search by ID / Name…**                   | Substring / regex search across CellSpaces (id + name), Nodes (id), Edges (id). Per-type filter checkboxes.                           |
 | **Measure Distance**                       | Toggle. Click two points → dialog reports Euclidean distance in **cm** and **m**, plus Δx and Δy in cm.                              |
 | **Repair: drop trailing duplicate vertices…** | Trims any `<pos>` siblings that simply repeat the start of the polygon ring (a defect of older versions of `_update_ring_coords`).   |
+| **Repair: remove self-loop edges…**        | Deletes edges whose two endpoints are the same Node. A self-loop cannot change reachability, so routing is unaffected, but every traversal still walks it. Shows a preview grouped by the owning cell (with floor and room name) before deleting. These come from upstream converters that map each endpoint to `owner_cell(boundary)` without checking whether both boundaries belong to the *same* cell — a room with two or more openings then loops back on itself. Rebuilding the intended per-opening nodes needs boundary geometry the file usually does not carry, so removal is the only in-editor repair; regenerate from the source data to keep that detail. |
 | **Repair: drop self-intersecting tail…**   | Heuristic last-resort — pops the last vertex iteratively until the ring stops self-intersecting.                                      |
 | **Normalize Floor Z…**                     | Per-level dialog with a `Floor Z (cm)` and `Ceiling Z (cm)` field. Every cell on the floor is rebuilt with floor ring at Floor Z and ceiling ring at Ceiling Z; nodes move to Floor Z; edge endpoint Zs follow the node Zs. The override is persisted so subsequent New Cell / New Node use the right Z automatically. Default proposals come from the user's New-Floor override, then the most-common non-zero Z among existing cells. The writer fully **replaces** any stale CellSpace XML element with a fresh one carrying the new Z (no zombie geometry left behind). |
 
@@ -511,6 +513,51 @@ geometry and tag.
   → Resolved. The writer emits the human-readable name as
   `<cellSpaceName>`; the parser now accepts both
   `<cellSpaceName>` and a legacy plain `<name>`.
+
+- **Korean (or any CJK) cell names render as boxes on the canvas**  
+  → Resolved. Tk widgets inherit `TkDefaultFont` and render CJK fine, but
+  the Matplotlib canvas never goes through Tk — it defaults to DejaVu Sans,
+  which contains no Hangul glyphs at all, so every label came out as tofu
+  and each character emitted a "Glyph … missing from font(s)" warning (3477
+  of them on a single floor of the hospital model). The app now picks the
+  first installed CJK-capable family at import time — Malgun Gothic on
+  Windows, Apple SD Gothic Neo on macOS, Noto Sans KR / NanumGothic on
+  Linux — and prepends it to `font.sans-serif`, keeping DejaVu Sans behind
+  it for symbols the CJK face lacks. If no such font is installed the app
+  still runs (Latin labels are unaffected) and says so in the status bar.
+
+- **Edge endpoints reference cells instead of nodes / re-pointing an edge didn't stick**  
+  → Resolved. An IndoorGML Edge connects Nodes, but converters commonly
+  write the dual CellSpace id instead (`#cell_X` where the node is
+  `S_cell_X`). No XSD validator catches this: `xlink:href` is declared
+  `xsd:anyURI`, so the schema only checks that the string looks like a URI,
+  never what kind of element it points at. Such a file validates cleanly
+  and still breaks any router that dereferences the endpoint.
+
+  The bulk of these come from upstream — in a 17-floor hospital model all
+  5917 `T_*` edges were cell-style while all 1483 editor-made `edge_new_*`
+  edges were correct. But the editor could *introduce* them too:
+  `normalize_edge_connects_to_node_ids()` passes through any reference it
+  cannot resolve, and the new-edge writer emitted `edge.connects` verbatim,
+  so an unresolved id was written straight into the file as a cell
+  reference. Both the writer and the reader now go through
+  `resolve_connect_ref_to_node_id()`, which follows the cell's `duality`
+  link rather than guessing an `S_`+id naming convention (this model has
+  cells like `VS_S_2d0c0 → S_2d0c0` that break the pattern). Opening a file
+  that contains such references reports how many; saving writes them all
+  back as Node references. Genuinely unresolvable ids are preserved so
+  Check → Find Broken Edge Connections still reports them.
+
+  The same gap meant changing an edge's endpoints in the editor never
+  reached the file — the writer only ever updated geometry.
+
+- **A cell's outline looks right in the editor but a validator rejects the ring**  
+  → Resolved. `gml:LinearRing` must repeat its first position at the end.
+  Dragging vertex 0 of a parsed cell used to move only that vertex, leaving
+  the closing twin at the old coordinate, so the ring opened. The drag now
+  moves both twins, and `_update_ring_coords` — the single point every
+  geometry edit passes through — closes the ring before writing. Files that
+  already contain open rings are repaired on the next Save.
 
 - **Changing Class in the Selection panel didn't persist**  
   → Resolved. The Apply button now rewrites the XML element's tag
