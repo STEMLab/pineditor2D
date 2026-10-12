@@ -1,5 +1,5 @@
 [README.md](https://github.com/user-attachments/files/27756751/README.md)
-# PyInEditor — IndoorGML 2.0 Editor
+# PInEditor — IndoorGML 2.0 Editor
 
 A Tkinter + Matplotlib desktop editor for **IndoorGML 2.0** files.
 Inspect, edit, and refactor multi-floor indoor maps: cell spaces,
